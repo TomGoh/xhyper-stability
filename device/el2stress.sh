@@ -29,13 +29,17 @@ mkdir -p $TMP
 ng() { $N "$@" --timeout ${T}s --temp-path $TMP --metrics-brief > $TMP/ng-$S-$$.log 2>&1; echo "EL2STRESS $S stress-ng rc=$?"; tail -4 $TMP/ng-$S-$$.log; }
 until_end() { end=$(( $(date +%s) + T )); while [ $(date +%s) -lt $end ]; do "$@" >/dev/null 2>&1; done; }
 
+# In `all` (LIGHT=1) every part runs at about a quarter of its own step's size: all of them at full size drove the
+# load average past 1000 on T11206 (2026-10-13), System UI and system_server stopped answering broadcasts, and CPU
+# hot-unplug's stop_machine took 170 ms; that measures queueing, not more exits per CPU.
+n4() { [ -n "${LIGHT:-}" ] && echo "${2:-1}" || echo "$1"; }
 ipi() {
-  ng --membarrier 4 --tlb-shootdown 4 --affinity 4 --switch 4 --futex 4 &
-  until_end $D/hackbench -T -g 4 -l 20000 -s 100; echo "EL2STRESS $S hackbench rc=0"
+  ng --membarrier $(n4 4) --tlb-shootdown $(n4 4) --affinity $(n4 4 2) --switch $(n4 4 2) --futex $(n4 4) &
+  until_end $D/hackbench -T -g $(n4 4 2) -l 20000 -s 100; echo "EL2STRESS $S hackbench rc=0"
   wait
 }
-timer() { ng --timer 8 --timer-freq 50000 --itimer 4 --clock 2; }
-idle() { ng --sleep 16 --sleep-max 256; }
+timer() { ng --timer $(n4 8 4) --timer-freq $(n4 50000 20000) --itimer $(n4 4 2) --clock $(n4 2); }
+idle() { ng --sleep $(n4 16 4) --sleep-max $(n4 256 64); }
 traffic() {
   [ -n "$GW" ] && { timeout $T ping -f -q $GW > $TMP/ping.log 2>&1; echo "EL2STRESS $S ping $(tail -2 $TMP/ping.log | tr '\n' ' ')"; } &
   until_end sh -c "dd if=/dev/zero of=$TMP/dd.bin bs=1048576 count=128 conv=fsync; rm -f $TMP/dd.bin"
@@ -129,7 +133,8 @@ gpu() {
   irq=$(awk '$NF ~ /gpu/ || $0 ~ /\.gpu/ { sub(":", "", $1); print $1; exit }' /proc/interrupts)
   cnt() { awk -v n="$irq:" '$1 == n { s = 0; for (i = 2; i <= 9; i++) s += $i; print s }' /proc/interrupts; }
   input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard
-  am start -n org.linaro.glmark2/.Glmark2Activity -e args "--run-forever" > /dev/null 2>&1
+  # Full screen even in the desktop (freeform) mode: a small window renders far fewer pixels.
+  am start --windowingMode 1 -n org.linaro.glmark2/.Glmark2Activity -e args "--run-forever" > /dev/null 2>&1
   sleep 5; a=$(cnt); t0=$(date +%s); fmax=0
   end=$(( t0 + T - 10 ))
   while [ $(date +%s) -lt $end ]; do
@@ -140,7 +145,7 @@ gpu() {
   am force-stop org.linaro.glmark2
   echo "EL2STRESS $S glmark2 gpu_irq=$irq irq_per_s=$(( (b - a) / (t1 - t0 + 1) )) max_freq=$fmax rc=0"
 }
-all() { ipi & timer & idle & affinity & hotplug & copy & gpu & wait; }
+all() { export LIGHT=1; ipi & timer & idle & affinity & hotplug & copy & gpu & wait; }
 
 case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|radio|copy|gpu|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
 echo "EL2STRESS_DONE $S"

@@ -21,7 +21,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
 ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
+WARNINGS = {'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
 
 
@@ -481,6 +481,23 @@ class Run:
             rc, out = self.dev.adb(*args, timeout=600)
             self.event('INFO' if 'Success' in out else 'SKIP', f'apk {k} ({pkg} {ver}): ' + out.strip().splitlines()[-1][:120])
 
+    def dismiss_anr_dialogs(self, tag, tries=4):
+        """A not-responding dialog left on screen blocks every later UI step: answer 'wait' (等待) and record it."""
+        for _ in range(tries):
+            _, f = self.dev.sh('dumpsys window | grep -m1 mCurrentFocus', timeout=60)
+            if 'Not Responding' not in f:
+                return
+            _, x = self.dev.sh('uiautomator dump /sdcard/stab-ui.xml >/dev/null 2>&1; cat /sdcard/stab-ui.xml', timeout=90)
+            m = re.search(r'text="(?:等待|Wait)"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', x or '')
+            who = re.search(r'Not Responding: ([^}\s]+)', f)
+            self.event('ANR_DIALOG', f'{tag}: dialog for {who.group(1) if who else "?"} answered with wait')
+            if m:
+                a, b, c, d = map(int, m.groups())
+                self.dev.sh(f'input tap {(a + c) // 2} {(b + d) // 2}', timeout=30)
+            else:
+                self.dev.sh('input keyevent KEYCODE_BACK', timeout=30)
+            time.sleep(2)
+
     def tool(self, name):
         if name in self.tools:
             return True
@@ -746,6 +763,7 @@ class Run:
                 time.sleep(10)
             if usb:
                 usb.kill()
+            self.dismiss_anr_dialogs(step)
             self.save(f'el2stress-{step}.txt', out)
             if f'EL2STRESS_DONE {step}' not in out:
                 self.event('STRESS_FAIL', f'{step}: no EL2STRESS_DONE within {secs + 300} s')
@@ -812,6 +830,7 @@ class Run:
                 self.phase = f"{i}-{p['type']}"
                 self.event('PHASE_START', json.dumps(p, ensure_ascii=False))
                 getattr(self, 'phase_' + p['type'])(p)
+                self.dismiss_anr_dialogs('phase-end')
                 self.snapshot('phase-end')
                 self.event('PHASE_END', f'{(time.time() - t0) / 60:.0f} min into the run')
         except Abort as e:
