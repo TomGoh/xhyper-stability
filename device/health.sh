@@ -27,12 +27,22 @@ kv therm_max_mc "$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | grep 
 kv battery "$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)% $(cat /sys/class/power_supply/battery/status 2>/dev/null)"
 kv tombstones "$(ls /data/tombstones 2>/dev/null | grep -c '^tombstone_')"
 kv anr_files "$(ls /data/anr 2>/dev/null | wc -l)"
+# Crash records Android keeps in dropbox (app/native crashes, ANRs, watchdog and pre-watchdog reports, tombstones).
+kv dropbox_crash "$(ls /data/system/dropbox 2>/dev/null | grep -cE 'crash|anr|watchdog|tombstone')"
 kv pstore "$(ls /sys/fs/pstore 2>/dev/null | tr '\n' ' ')"
 # Panic/oops records kept across reboots, with their write time: a new name or a new time is a new crash record.
 kv pstore_dumps "$(for f in /sys/fs/pstore/dmesg-*; do [ -e "$f" ] && printf '%s:%s ' "${f##*/}" "$(stat -c %Y "$f")"; done)"
 kv dmesg_last "$(dmesg | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')"
 
 # Kernel lines that matter for stability (lockups, oopses, watchdogs, RCU stalls, hung tasks, warnings).
+# Device inventory: compared by the host after every reboot and resume (a driver that failed to probe or to resume
+# under the hypervisor drops out of these lists).
+echo "--- inventory"
+for d in /sys/bus/pci/devices/*; do [ -e "$d" ] && echo "pci ${d##*/} $(cat $d/vendor 2>/dev/null):$(cat $d/device 2>/dev/null)"; done
+for d in /sys/bus/usb/devices/*; do [ -e "$d/idVendor" ] && echo "usb $(cat $d/idVendor):$(cat $d/idProduct)"; done
+sed -n 's/^ *\([0-9]*\) \[\(.*\)\].*/sound \1 \2/p' /proc/asound/cards 2>/dev/null
+for d in /sys/class/net/*; do echo "net ${d##*/}"; done
+sed -n 's/^N: Name="\(.*\)"/input \1/p' /proc/bus/input/devices 2>/dev/null
 echo "--- kernel_bad"
 dmesg | grep -E 'BUG:|Oops|Unable to handle|soft lockup|hard LOCKUP|rcu.*(stall|self-detected)|blocked for more than|Kernel panic|WARNING: CPU|---\[ end trace|watchdog|preemptoff_warn|Unhandled|SError|synchronous external abort' | tail -60
 echo "--- crash_buffer"

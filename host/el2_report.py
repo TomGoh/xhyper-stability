@@ -32,18 +32,36 @@ def policy_map(run_dir):
     return {c: 0 if c < 4 else 1 if c < 7 else 2 for c in range(8)}
 
 
+def expand(cpulist):
+    out = set()
+    for part in cpulist.split(','):
+        lo, _, hi = part.partition('-')
+        if lo.isdigit():
+            out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+ONLINE = {}  # path -> online CPU set of the block last yielded (None when the log does not record it)
+
+
 def blocks(path, start=0):
-    """Yields (offset_after, boottime, epoch, freqs_khz, {cpu: (cycles, ts_ns)}) for complete blocks from byte offset."""
+    """Yields (offset_after, boottime, epoch, freqs_khz, {cpu: (cycles, ts_ns)}) for complete blocks from byte offset;
+    ONLINE[path] holds that block's online CPUs (logs written since 2026-10-13 17:00 record them)."""
+    self_online = [None]
     with open(path, errors='replace') as f:
         f.seek(start)
-        cur, pos = None, start
+        cur, pos, cur_online = None, start, None
         for line in iter(f.readline, ''):
             if line.startswith('T '):
                 if cur:
+                    ONLINE[path] = cur_online
                     yield (pos,) + cur
                 parts = line.split()
                 try:
-                    cur = (float(parts[1]), int(parts[2]), [int(x) for x in parts[3:]], {})
+                    cur = (float(parts[1]), int(parts[2]), [int(x) for x in parts[3:] if not x.startswith('on=')], {})
+                    on = next((x[3:] for x in parts if x.startswith('on=')), '')
+                    self_online[0] = expand(on) if on else None
+                    cur_online = self_online[0]
                 except (ValueError, IndexError):
                     cur = None
             elif cur is not None:
@@ -69,7 +87,8 @@ class Scanner:
             for off, bt, ep, fr, cpus in blocks(path, self.offsets.get(path, 0)):
                 self.offsets[path] = off
                 n = self.ncpu.setdefault(boot, len(cpus))
-                missing = [c for c in range(n) if c not in cpus]
+                online = ONLINE.get(path)
+                missing = [c for c in range(n) if c not in cpus and (online is None or c in online)]
                 if missing:
                     out.append(('EL2_MISSING', ep, f'boot {boot[:8]} t={bt:.0f}s: no sample for CPU {missing}'))
                 down = []

@@ -61,7 +61,7 @@
     },
     {
       "type": "el2_stress",
-      "seconds": 300,
+      "seconds": 240,
       "steps": [
         "ipi",
         "timer",
@@ -69,6 +69,8 @@
         "traffic",
         "affinity",
         "hotplug",
+        "radio",
+        "copy",
         "pmu",
         "all",
         "ipi",
@@ -77,10 +79,12 @@
         "traffic",
         "affinity",
         "hotplug",
+        "radio",
+        "copy",
         "pmu",
         "all"
       ],
-      "note": "one exit class per step (device/el2stress.sh), two rounds; late in the night: a hang here can only cost the standby phase"
+      "note": "one exit class per step (device/el2stress.sh; radio and copy borrowed from kylin100-autotest), two rounds; late in the night: a hang here can only cost the standby phase"
     },
     {
       "type": "standby",

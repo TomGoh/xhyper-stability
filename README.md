@@ -35,6 +35,7 @@ python3 host/stab.py report <输出目录>      # 重新生成 summary.md
 | `memtest` | stressapptest 在高负载下检查内存内容 | 第二阶段映射、缓存维护；出错时报数据不一致 |
 | `latency` | cyclictest 测空闲和有负载时的唤醒延迟 | 定时器注入、唤醒路径 |
 | `standby` | 长时间灭屏睡眠，定时唤醒检查 | 长时间深度睡眠后的恢复 |
+| `el2_stress` | `device/el2stress.sh` 按退出类型逐项施压，每项后记 EL2 占比（平行日志）和串口上的热点路径计数：`ipi`（membarrier、TLB 击落、hackbench）、`timer`（高频 POSIX 定时器）、`idle`（大量短睡眠）、`traffic`（Wi-Fi ping 洪泛、fsync 写盘、USB 大流量）、`affinity`（轮换忙碌中断的路由）、`hotplug`（1–7 号核反复上下线）、`radio`（Wi-Fi 与蓝牙关开）、`copy`（写盘、丢页缓存、读回比 md5）、`pmu`（满负载下 10 kHz 全系统采样，关掉内核限流，先停监视器）、`all`（同时） | 中断注入与就地应答、核间中断陷入、分发器访问、电源调用、PMU 溢出路径 |
 | `monitor_soak` | （可选）启用 EL2 监视器后加压，检查各核 EL2 周期单调递增 | 监视器与电源括号 |
 
 ## EL2 平行日志
@@ -61,6 +62,7 @@ python3 host/stab.py report <输出目录>      # 重新生成 summary.md
 ## 故障分类
 
 - **错误（任何一个都判 FAIL）**：`UNEXPECTED_REBOOT`（开机号在计划外改变，附开机原因和 pstore）、`DEVICE_GONE`（`lost_timeout_s` 内连不上，要人去看）、`BOOT_FAIL`、`RESUME_TIMEOUT`、`SUSPEND_FAIL`（睡眠失败计数增加）、`KERNEL_BAD`（新的 oops、锁死、RCU 停顿、看门狗、`WARNING: CPU` 行）、`STRESS_FAIL`、`MEMTEST_FAIL`、`IDENTITY_MISMATCH`、`MONITOR_FAIL`。
+- 重启和唤醒后比较设备清单（PCI、USB、声卡、网络接口、输入设备），少了任何一项记 `DEVICE_MISSING`（错误）；dropbox 里崩溃、无响应、看门狗记录增加记警告。
 - **警告**：`DEVICE_LOST`（暂时失联又回来了）、应用崩溃、无响应、墓碑文件、`SUSPEND_NOT_ENTERED`（睡眠在进入前被放弃）、`SKIP`（工具缺失，或者某个压力项在这台设备上不能运行）。
 - 出错后先在原厂镜像上用同一个计划复现：两边都有的是平台或厂商的问题，只在虚拟化层下出现的才归我们。
 

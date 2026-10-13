@@ -19,7 +19,7 @@ import el2_report  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
-ERRORS = {'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
+ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
 WARNINGS = {'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
@@ -222,9 +222,12 @@ class Run:
         prev, self.last = self.last, h
         if prev is None:  # baseline: what is already there is not a finding
             self.known_dumps = set(h.get('pstore_dumps', '').split())
+            self.inventory = set(h['_sec'].get('inventory', []))
             for s in ('kernel_bad', 'crash_buffer', 'events'):
                 self.seen.update(h['_sec'].get(s, []))
             return h
+        if h['boot_id'] != prev['boot_id'] or tag.startswith('suspend'):
+            self.check_inventory(h, tag)
         if h['boot_id'] != prev['boot_id']:
             if self.expect_reboot:
                 self.expect_reboot = False
@@ -249,7 +252,7 @@ class Run:
                             self.event(k, line[:300])
                     elif kind != 'ANR' or 'am_anr' in line:
                         self.event(kind, line[:300])
-        for k, kind in (('tombstones', 'TOMBSTONE'), ('anr_files', 'ANR')):
+        for k, kind in (('tombstones', 'TOMBSTONE'), ('anr_files', 'ANR'), ('dropbox_crash', 'CRASH')):
             if num(h, k) > num(prev, k):
                 self.event(kind, f'{k} {num(prev, k)} -> {num(h, k)}')
         new_dumps = set(h.get('pstore_dumps', '').split()) - self.known_dumps
@@ -264,6 +267,18 @@ class Run:
             self.event('SUSPEND_FAIL', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}, "
                        f"last_failed_dev={h.get('suspend_last_failed_dev')} step={h.get('suspend_last_failed_step')}")
         return h
+
+    def check_inventory(self, h, tag):
+        """After a reboot or a resume every device of the first snapshot must be back (PCI, USB, sound cards, network
+        interfaces, input devices): a driver that failed to probe or to resume drops out."""
+        cur = set(h['_sec'].get('inventory', []))
+        if not cur or not getattr(self, 'inventory', None):
+            return
+        missing, extra = sorted(self.inventory - cur), sorted(cur - self.inventory)
+        if missing:
+            self.event('DEVICE_MISSING', f'{tag}: {len(missing)} missing: ' + '; '.join(missing)[:300])
+        if extra:
+            self.event('INFO', f'{tag}: new in the inventory: ' + '; '.join(extra)[:200])
 
     def lost(self, tag):
         self.event('DEVICE_LOST', f'no adb/health answer ({tag}); waiting up to {self.lost_timeout} s')

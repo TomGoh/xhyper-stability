@@ -1,0 +1,11 @@
+{
+  "name": "smoke for the steps borrowed from kylin100-autotest: inventory after reboot and resume, radio off/on, copy with md5 (about 10 minutes)",
+  "health_interval_s": 60,
+  "lost_timeout_s": 600,
+  "el2_monitor": {"artifacts": "${XHYPER_MONITOR_ARTIFACTS}", "interval_s": 1},
+  "phases": [
+    {"type": "reboot_loop", "count": 1, "settle_s": 30},
+    {"type": "el2_stress", "seconds": 90, "steps": ["radio", "copy"]},
+    {"type": "suspend", "cycles": 2, "sleep_s": 15, "awake_s": 5}
+  ]
+}

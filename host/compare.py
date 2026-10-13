@@ -28,7 +28,7 @@ def load(d):
         for e in evs if e['kind'] == 'INFO' and re.match(r'suspend \S+: success', e['msg']))
     r['stress'] = collections.Counter(re.sub(r'.*: ', '', e['msg']) for e in evs
                                       if e['kind'] in ('INFO', 'STRESS_FAIL', 'SKIP') and e['msg'].startswith('stress-ng'))
-    r['memtest'] = [e['msg'] for e in evs if 'stressapptest' in e['msg'] or e['kind'] == 'MEMTEST_FAIL']
+    r['memtest'] = [e['msg'] for e in evs if e['msg'].startswith('stressapptest') or e['kind'] == 'MEMTEST_FAIL']
     for load_ in ('idle', 'stress'):
         p = os.path.join(d, f'cyclictest-{load_}.txt')
         r[f'cyc_{load_}'] = [int(x) for x in re.findall(r'Max:\s+(\d+)', open(p).read())] if os.path.exists(p) else []

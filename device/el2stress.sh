@@ -14,7 +14,12 @@
 #   hotplug   CPU_OFF/CPU_ON: CPUs 1-7 taken offline and back online in turn; all CPUs online again at the end
 #   pmu       PMU overflow interrupts: system-wide cpu-cycles sampling at 10 kHz with every CPU 80% busy and the
 #             kernel's sampling throttle off for the step (the EL2 monitor must be stopped first)
-#   all       ipi + timer + idle + affinity (with traffic) + hotplug at once
+#   radio     Wi-Fi and Bluetooth off/on in turn (driver unload/reload: interrupts freed and requested again, GIC
+#             enable/route writes, PCIe MSI set-up); a round passes when Wi-Fi has an IPv4 address and pings the
+#             gateway and Bluetooth reports on again; original states restored (borrowed from kylin100-autotest)
+#   copy      random data written with fsync, page cache dropped, read back and md5-compared (storage interrupts and
+#             DMA; catches silent corruption a crash check misses; borrowed from kylin100-autotest)
+#   all       ipi + timer + idle + affinity (with traffic) + hotplug + copy at once
 # Output: one line per finished part, "EL2STRESS <step> <part> rc=<n>"; the last line "EL2STRESS_DONE <step>".
 S=${1:?step}; T=${2:?seconds}; GW=${3:-}
 D=/data/local/tmp/stab; N=$D/stress-ng; TMP=$D/tmp
@@ -88,7 +93,35 @@ pmu() {
   echo $pc > /proc/sys/kernel/perf_cpu_time_max_percent; echo $pr > /proc/sys/kernel/perf_event_max_sample_rate
   echo "EL2STRESS $S restored perf_cpu_time_max_percent=$pc perf_event_max_sample_rate=$pr"
 }
-all() { ipi & timer & idle & affinity & hotplug & wait; }
+radio() {
+  bt0=$(settings get global bluetooth_on); end=$(( $(date +%s) + T )); n=0; wf=0; bf=0
+  while [ $(date +%s) -lt $end ]; do
+    n=$((n + 1))
+    svc wifi disable; sleep 3; svc wifi enable
+    ok=0; for i in $(seq 1 30); do ip -4 addr show wlan0 2>/dev/null | grep -q inet && { ok=1; break; }; sleep 1; done
+    [ $ok = 1 ] && [ -n "$GW" ] && { ping -c 3 -W 2 $GW > /dev/null 2>&1 || ok=0; }
+    [ $ok = 1 ] || wf=$((wf + 1))
+    cmd bluetooth_manager disable > /dev/null 2>&1; sleep 2; cmd bluetooth_manager enable > /dev/null 2>&1
+    ok=0; for i in $(seq 1 30); do [ "$(settings get global bluetooth_on)" = 1 ] && { ok=1; break; }; sleep 1; done
+    [ $ok = 1 ] || bf=$((bf + 1))
+  done
+  svc wifi enable
+  [ "$bt0" = 1 ] || cmd bluetooth_manager disable > /dev/null 2>&1
+  echo "EL2STRESS $S radio cycles=$n wifi_fail=$wf bt_fail=$bf rc=$([ $wf = 0 ] && [ $bf = 0 ] && echo 0 || echo 1)"
+}
+copy() {
+  end=$(( $(date +%s) + T )); n=0; bad=0
+  while [ $(date +%s) -lt $end ]; do
+    n=$((n + 1))
+    dd if=/dev/urandom of=$TMP/copy-src bs=1048576 count=64 2>/dev/null; a=$(md5sum $TMP/copy-src | cut -d' ' -f1)
+    cp $TMP/copy-src $TMP/copy-dst; sync; echo 3 > /proc/sys/vm/drop_caches
+    b=$(md5sum $TMP/copy-dst | cut -d' ' -f1); c=$(md5sum $TMP/copy-src | cut -d' ' -f1)
+    [ "$a" = "$b" ] && [ "$a" = "$c" ] || { bad=$((bad + 1)); echo "EL2STRESS $S MISMATCH round $n src=$a dst=$b src-again=$c"; }
+    rm -f $TMP/copy-src $TMP/copy-dst
+  done
+  echo "EL2STRESS $S copy rounds=$n mismatches=$bad rc=$([ $bad = 0 ] && echo 0 || echo 1)"
+}
+all() { ipi & timer & idle & affinity & hotplug & copy & wait; }
 
-case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
+case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|radio|copy|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
 echo "EL2STRESS_DONE $S"
