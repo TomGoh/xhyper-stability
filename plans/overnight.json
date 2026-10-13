@@ -71,6 +71,7 @@
         "hotplug",
         "radio",
         "copy",
+        "gpu",
         "pmu",
         "all",
         "ipi",
@@ -81,6 +82,7 @@
         "hotplug",
         "radio",
         "copy",
+        "gpu",
         "pmu",
         "all"
       ],

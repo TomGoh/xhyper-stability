@@ -455,6 +455,32 @@ class Run:
             self.el2_setup()
         self.next_check = time.time() + self.interval
 
+    def ensure_apks(self, keys):
+        """Install the APKs named in third_party/apks.lock from STAB_APK_DIR, after checking their sha256."""
+        lock = {}
+        for line in open(os.path.join(REPO, 'third_party', 'apks.lock')):
+            f = line.split()
+            if len(f) >= 6 and not line.startswith('#'):
+                lock[f[0]] = f
+        d = os.environ.get('STAB_APK_DIR', '')
+        for k in keys:
+            if k not in lock:
+                self.event('SKIP', f'apk {k}: not in third_party/apks.lock'); continue
+            _, fname, pkg, ver, sha, flags = lock[k][:6]
+            _, have = self.dev.sh(f'pm path {pkg}', timeout=30)
+            path = os.path.join(d, fname)
+            if not d or not os.path.exists(path):
+                if 'package:' not in have:
+                    self.event('SKIP', f'apk {k}: {fname} not found in STAB_APK_DIR ({d or "unset"})')
+                continue
+            import hashlib
+            h = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+            if h != sha:
+                self.event('SKIP', f'apk {k}: {fname} sha256 {h[:16]} is not the locked {sha[:16]}'); continue
+            args = ['install', '-r'] + ([flags] if flags != '-' else []) + [path]
+            rc, out = self.dev.adb(*args, timeout=600)
+            self.event('INFO' if 'Success' in out else 'SKIP', f'apk {k} ({pkg} {ver}): ' + out.strip().splitlines()[-1][:120])
+
     def tool(self, name):
         if name in self.tools:
             return True
@@ -694,6 +720,8 @@ class Run:
         m = re.search(r'default via (\S+) dev wlan0', rt)
         gw = m.group(1) if m else ''
         base, secs = self.phase, int(p.get('seconds', 180))
+        if any(s_ in ('gpu', 'all') for s_ in p.get('steps', [])):
+            self.ensure_apks(['glmark2'])
         for step in p.get('steps', ['ipi', 'timer', 'idle', 'traffic', 'affinity', 'hotplug', 'pmu', 'all']):
             self.phase = f'{base}/{step}'
             self.event('PHASE_START', f'{step} {secs} s')

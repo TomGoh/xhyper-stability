@@ -11,6 +11,7 @@
 | `host/stab.py` | 主机端调度：按计划依次执行各阶段，定期做健康快照，记录事件，写出总结。只用 Python 3 标准库 |
 | `device/health.sh` | 设备端只读快照（以 root 运行）：开机号、开机原因、睡眠计数、频率、温度、pstore、内核异常行、崩溃缓冲区、无响应 |
 | `plans/*.json` | 测试计划：`smoke.json`（每个阶段跑一次，约 20 分钟），`overnight.json`（约 12 小时） |
+| `third_party/apks.lock` | 测试会安装的 APK 清单（文件名、包名、版本、sha256）；APK 本身不进仓库（许可、体积、内部应用），运行时从 `STAB_APK_DIR` 目录取，哈希对上才装 |
 | `third_party/` | 公开压力工具的固定版本和静态 aarch64 构建脚本（stress-ng、stressapptest、rt-tests 的 cyclictest），以及 Fastbot 的拉取脚本；编出的程序不入库 |
 
 ## 用法

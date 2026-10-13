@@ -19,7 +19,9 @@
 #             gateway and Bluetooth reports on again; original states restored (borrowed from kylin100-autotest)
 #   copy      random data written with fsync, page cache dropped, read back and md5-compared (storage interrupts and
 #             DMA; catches silent corruption a crash check misses; borrowed from kylin100-autotest)
-#   all       ipi + timer + idle + affinity (with traffic) + hotplug + copy at once
+#   gpu       GPU load: glmark2 rendering forever (the harness installs it from STAB_APK_DIR); GPU job interrupts, GPU
+#             memory mapping, display vsync; reports the GPU interrupt rate and the GPU frequency reached
+#   all       ipi + timer + idle + affinity (with traffic) + hotplug + copy + gpu at once
 # Output: one line per finished part, "EL2STRESS <step> <part> rc=<n>"; the last line "EL2STRESS_DONE <step>".
 S=${1:?step}; T=${2:?seconds}; GW=${3:-}
 D=/data/local/tmp/stab; N=$D/stress-ng; TMP=$D/tmp
@@ -121,7 +123,24 @@ copy() {
   done
   echo "EL2STRESS $S copy rounds=$n mismatches=$bad rc=$([ $bad = 0 ] && echo 0 || echo 1)"
 }
-all() { ipi & timer & idle & affinity & hotplug & copy & wait; }
+gpu() {
+  pm path org.linaro.glmark2 > /dev/null 2>&1 || { echo "EL2STRESS $S glmark2 not installed rc=3"; return; }
+  dev=$(ls -d /sys/class/devfreq/*.gpu 2>/dev/null | head -1)
+  irq=$(awk '$NF ~ /gpu/ || $0 ~ /\.gpu/ { sub(":", "", $1); print $1; exit }' /proc/interrupts)
+  cnt() { awk -v n="$irq:" '$1 == n { s = 0; for (i = 2; i <= 9; i++) s += $i; print s }' /proc/interrupts; }
+  input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard
+  am start -n org.linaro.glmark2/.Glmark2Activity -e args "--run-forever" > /dev/null 2>&1
+  sleep 5; a=$(cnt); t0=$(date +%s); fmax=0
+  end=$(( t0 + T - 10 ))
+  while [ $(date +%s) -lt $end ]; do
+    f=$(cat $dev/cur_freq 2>/dev/null); [ "${f:-0}" -gt $fmax ] && fmax=$f
+    input keyevent KEYCODE_WAKEUP; sleep 10
+  done
+  b=$(cnt); t1=$(date +%s)
+  am force-stop org.linaro.glmark2
+  echo "EL2STRESS $S glmark2 gpu_irq=$irq irq_per_s=$(( (b - a) / (t1 - t0 + 1) )) max_freq=$fmax rc=0"
+}
+all() { ipi & timer & idle & affinity & hotplug & copy & gpu & wait; }
 
-case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|radio|copy|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
+case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|radio|copy|gpu|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
 echo "EL2STRESS_DONE $S"

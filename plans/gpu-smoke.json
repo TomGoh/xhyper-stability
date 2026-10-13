@@ -1,0 +1,7 @@
+{
+  "name": "gpu smoke: the glmark2 GPU step once for 120 s",
+  "health_interval_s": 60,
+  "lost_timeout_s": 600,
+  "el2_monitor": {"artifacts": "${XHYPER_MONITOR_ARTIFACTS}", "interval_s": 1},
+  "phases": [{"type": "el2_stress", "seconds": 120, "steps": ["gpu"]}]
+}

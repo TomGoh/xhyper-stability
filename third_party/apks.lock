@@ -1,0 +1,12 @@
+# APKs the harness can install. Not in this repository (licences, size, internal apps): host/stab.py takes them from
+# the directory in STAB_APK_DIR, checks the sha256, and installs only on a match.
+# key  file  package  version  sha256  install-flags  source
+glmark2  org.linaro.glmark2_2.apk  org.linaro.glmark2  2023.01  45bb2451be0db777cb5e5ac1cadcc7a09333e59a0912d6536108d2b66857d6ae  -  Linaro glmark2 (GPLv3), from the colleague test package v1.62
+gpugflops  gpugflops.apk  com.ioncannon.cpuburn.gpugflops  0.75  3bd69916cef599b2ae87adb0d56762dd4735fde770359d4d900e5f9d6d9ae8ee  --bypass-low-target-sdk-block  colleague test package v1.62
+gpugflops2  com.ioncannon.cpuburn.gpugflops2.apk  com.ioncannon.cpuburn.gpugflops  2.1  8a97e4986c632dfdb88accd05f098904987f56f33e6d82371c0680d3ce323075  --bypass-low-target-sdk-block  colleague test package v1.62
+gpu_test  gpu_test.apk  com.AIDatskoStudio.CPU.GPU.Performance.test  3.1.3  1fe68887dfc3c1bd05e88d859444106ffc36b453688deb6ae7d8c968a899cf0b  -  colleague test package v1.62
+fill_mm  fill_mm.apk  com.overkaiser.libmemory  1.010  31ec325bb38ba12e24d7a1f94cb79493bd738fc27adea9520948be86595b73ad  -  colleague test package v1.62
+cpdt  CPDT.apk  com.Saplin.CPDT  2.4.1  39dad551b2fd83e1454a029fc6d3f3d5aa59adf0d9b481518afa231df155c13a  -  colleague test package v1.62
+factorytest  factory_test_stable_v1.apk  com.kylinos.factorytest  1.0  e4844809a44845190d42d6727d37d1c4587a3a2a29d52b913eeb5dee14873557  -  colleague test package v1.62 (needs the platform signature to run as system)
+gfxbench  GFXBench_5.1.0.apk  com.glbenchmark.glbenchmark27  5.1.0  0a79c49ac3e7e3002127cd42227492657479ab9bd4313c9258a2c755799136b7  -  colleague test package v1.62
+3dmark  3DMark_v2.6.5025.apk  com.futuremark.dmandroid.application  2.6.5025  8806e8453a7835ea85fbd2109ab8d41ebe29fa74082608e6390a4932912088fa  -  colleague test package v1.62
