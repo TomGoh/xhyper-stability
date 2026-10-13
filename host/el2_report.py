@@ -7,8 +7,10 @@ Each <boot_id>.log under <run dir>/el2/ is a series of blocks: `T <boottime> <ep
 by `<cpu> <el2 cycles> <timestamp ns>` lines. From consecutive blocks of one boot the EL2 share of every CPU is
   (cycles delta) / (timestamp delta in s x the CPU's current frequency in Hz),
 an estimate: the frequency is the one read at the block, the cycle counter counts EL2 cycles at whatever frequency ran.
-Anomalies: a CPU's count going down (the monitor lost accumulated cycles), a CPU missing from a block (the driver could
-not sample it), and a CPU whose EL2 share stays above HIGH for SUSTAIN consecutive samples.
+Anomalies: a CPU's count going down (the monitor lost accumulated cycles; one event per block, listing the CPUs; on
+T11206 on 2026-10-13 every forced system suspend restarted CPUs 1-7 from about zero, CPU 0 kept its count), a CPU
+missing from a block (the driver could not sample it), and a CPU whose EL2 share stays above HIGH for SUSTAIN
+consecutive samples. Shares are computed only between samples whose count did not go down.
 """
 import collections, csv, datetime, glob, json, os, re, sys
 
@@ -70,12 +72,13 @@ class Scanner:
                 missing = [c for c in range(n) if c not in cpus]
                 if missing:
                     out.append(('EL2_MISSING', ep, f'boot {boot[:8]} t={bt:.0f}s: no sample for CPU {missing}'))
+                down = []
                 for c, (cy, ts) in cpus.items():
                     k = (boot, c)
                     if k in self.last:
                         pcy, pts = self.last[k]
                         if cy < pcy:
-                            out.append(('EL2_COUNT_DOWN', ep, f'boot {boot[:8]} t={bt:.0f}s CPU {c}: {pcy} -> {cy}'))
+                            down.append(f'{c} ({pcy} -> {cy})')
                         elif ts > pts and fr:
                             f = fr[min(self.pmap.get(c, 0), len(fr) - 1)] * 1000
                             share = (cy - pcy) / ((ts - pts) / 1e9 * f) if f else 0
@@ -84,6 +87,9 @@ class Scanner:
                                 out.append(('EL2_HIGH', ep, f'boot {boot[:8]} t={bt:.0f}s CPU {c}: EL2 share above '
                                             f'{HIGH:.0%} for {SUSTAIN} samples (now {share:.0%})'))
                     self.last[k] = (cy, ts)
+                if down:  # one event per reset; on T11206 every system suspend resets the non-boot CPUs (2026-10-13)
+                    out.append(('EL2_COUNT_DOWN', ep, f'boot {boot[:8]} t={bt:.0f}s: count restarted on CPU '
+                                + ', '.join(down)))
         return out
 
 
