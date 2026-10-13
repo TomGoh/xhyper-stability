@@ -1,0 +1,59 @@
+{
+  "name": "overnight: reboots, mixed use with hypervisor-path stress, forced suspend cycles, memory test, latency, screen-off standby (about 10.5 hours; start after 21:00)",
+  "health_interval_s": 300,
+  "lost_timeout_s": 900,
+  "el2_monitor": {
+    "artifacts": "${XHYPER_MONITOR_ARTIFACTS}",
+    "interval_s": 1,
+    "note": "EL2 parallel log: monitor modules loaded and started on every boot, /proc/xcore_stats sampled every second on the device. artifacts = a directory with the monitor's .ko set (environment variable XHYPER_MONITOR_ARTIFACTS); remove this key or pass --no-el2 to run without the monitor"
+  },
+  "phases": [
+    {
+      "type": "reboot_loop",
+      "count": 20,
+      "settle_s": 60
+    },
+    {
+      "type": "soak",
+      "minutes": 210,
+      "throttle_ms": 300,
+      "packages": [
+        "com.android.launcher3",
+        "com.kylinos.calculator",
+        "com.kylinos.note",
+        "com.kylinos.texteditor",
+        "com.kylinos.music",
+        "com.kylinos.filemanager",
+        "com.kylinos.gallery"
+      ],
+      "stress_every_min": 10,
+      "stress_seconds": 120,
+      "stress_args": "--affinity 2 --switch 2 --futex 2 --membarrier 1 --tlb-shootdown 1 --timer 2 --cyclic 1 --vm 1 --vm-bytes 5%",
+      "screen_cycle_min": 15,
+      "screen_off_s": 120,
+      "packages_note": "Runs start after 21:00 (nobody in the office), so sound is fine; the tablet is a test unit, so random deletes on shared storage are fine (the harness lives in /data/local/tmp/stab, out of reach). Still no clock or calendar: alarms and reminders set by random taps stay on the device and would wake later runs' suspend phases; no settings or browser."
+    },
+    {
+      "type": "suspend",
+      "cycles": 150,
+      "sleep_s": 20,
+      "awake_s": 15
+    },
+    {
+      "type": "memtest",
+      "minutes": 45,
+      "mem_pct": 25
+    },
+    {
+      "type": "latency",
+      "seconds": 120,
+      "stress_args": "--cpu 4 --switch 2 --timer 2 --affinity 2"
+    },
+    {
+      "type": "standby",
+      "hours": 3,
+      "suspend_s": 1500,
+      "awake_s": 30
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "name": "smoke: every phase once, about 20 minutes, to check the harness on a new device or image",
+  "health_interval_s": 60,
+  "lost_timeout_s": 600,
+  "el2_monitor": {
+    "artifacts": "${XHYPER_MONITOR_ARTIFACTS}",
+    "interval_s": 1,
+    "note": "EL2 parallel log: monitor modules loaded and started on every boot, /proc/xcore_stats sampled every second on the device. artifacts = a directory with the monitor's .ko set (environment variable XHYPER_MONITOR_ARTIFACTS); remove this key or pass --no-el2 to run without the monitor"
+  },
+  "phases": [
+    {
+      "type": "reboot_loop",
+      "count": 1,
+      "settle_s": 30
+    },
+    {
+      "type": "soak",
+      "minutes": 5,
+      "throttle_ms": 400,
+      "packages": [
+        "com.android.launcher3",
+        "com.kylinos.calculator",
+        "com.kylinos.note",
+        "com.kylinos.clock"
+      ],
+      "stress_every_min": 2,
+      "stress_seconds": 20,
+      "stress_args": "--affinity 2 --switch 2 --futex 2 --membarrier 1 --tlb-shootdown 1 --timer 2 --cyclic 1 --vm 1 --vm-bytes 5%",
+      "screen_cycle_min": 3,
+      "screen_off_s": 30
+    },
+    {
+      "type": "suspend",
+      "cycles": 3,
+      "sleep_s": 15,
+      "awake_s": 5
+    },
+    {
+      "type": "memtest",
+      "minutes": 1,
+      "mem_pct": 10
+    },
+    {
+      "type": "latency",
+      "seconds": 20,
+      "stress_args": "--cpu 4 --switch 2 --timer 2"
+    },
+    {
+      "type": "standby",
+      "hours": 0.03,
+      "suspend_s": 60,
+      "awake_s": 10
+    }
+  ]
+}
