@@ -516,6 +516,15 @@ class Run:
         _, q = self.dev.sh('content query --uri content://media/external/audio/media --projection _id:_data', timeout=30)
         m = re.search(r'_id=(\d+), _data=\S*/' + re.escape(os.path.basename(mu.get('path', '/sdcard/Music/test.mp3')))
                       + r'\b', q)
+        if not m and mu.get('local') and os.path.exists(os.path.expandvars(os.path.expanduser(mu['local']))):
+            # Random taps in the file manager may have deleted it: push the host copy again and look once more.
+            self.dev.adb('push', os.path.expandvars(os.path.expanduser(mu['local'])), mu['path'], timeout=300)
+            time.sleep(3)
+            _, q = self.dev.sh('content query --uri content://media/external/audio/media --projection _id:_data',
+                               timeout=30)
+            m = re.search(r'_id=(\d+), _data=\S*/' + re.escape(os.path.basename(mu['path'])) + r'\b', q)
+            self.event('INFO', f"music: track missing on the device, pushed {mu['local']} again"
+                       + ('' if m else ' (still not in the media library)'))
         if not m:
             if not getattr(self, '_music_skip', False):
                 self._music_skip = True
@@ -524,7 +533,8 @@ class Run:
         keys = ' '.join(['KEYCODE_VOLUME_DOWN'] * 15 + ['KEYCODE_VOLUME_UP'] * int(mu.get('volume', 3)))
         self.dev.sh(f'input keyevent {keys}', timeout=60)
         self.dev.sh(f'am start -a android.intent.action.VIEW -d content://media/external/audio/media/{m.group(1)} '
-                    f'-t audio/mpeg -n {pkg}/{mu.get("activity", ".activities.TrackActivity")}', timeout=30)
+                    f'-t {mu.get("mime", "audio/mpeg")} -n {pkg}/{mu.get("activity", ".activities.TrackActivity")}',
+                    timeout=30)
         time.sleep(5)
         st = self.music_state(pkg)
         self.event('INFO', f'music: track {m.group(1)} started, session state {st}')

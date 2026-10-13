@@ -33,11 +33,14 @@
       "screen_off_s": 120,
       "packages_note": "Runs start after 21:00 (nobody in the office), so sound is fine; the tablet is a test unit, so random deletes on shared storage are fine (the harness lives in /data/local/tmp/stab, out of reach). Still no clock or calendar: alarms and reminders set by random taps stay on the device and would wake later runs' suspend phases; no settings or browser.",
       "music": {
-        "path": "/sdcard/Music/test.mp3",
+        "path": "/sdcard/Music/stab-music.wav",
+        "mime": "audio/x-wav",
         "package": "com.kylinos.music",
         "activity": ".activities.TrackActivity",
         "volume": 8,
-        "check_every_s": 300
+        "check_every_s": 300,
+        "note": "host/make-music.py generates the track; STAB_MUSIC_LOCAL = its path on the host, pushed again if random taps deleted the device copy",
+        "local": "${STAB_MUSIC_LOCAL}"
       }
     },
     {
