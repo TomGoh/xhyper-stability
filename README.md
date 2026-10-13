@@ -49,6 +49,15 @@ python3 host/stab.py report <输出目录>      # 重新生成 summary.md
 
 开着监视器时，被测系统多了一个驱动、一个 PMU 使用者，每次深度空闲还多几次超级调用。出了问题，要去掉 `el2_monitor` 再跑一次，确认监视器有没有参与。
 
+## 串口
+
+`--serial-log <serial.txt>`：指向另一个进程正在写的串口抓取文件（每行带主机时间，例如工作区 `tools/perf/t11206-serial-capture.sh` 的输出；T11206 的 Linux 控制台和虚拟化层控制台共用这条 921600 的串口）。每次健康快照会往设备内核日志写一行 `STAB <阶段> <序号> <标签>`，这行也会出现在串口上，用来对齐两条时间线。每次健康检查扫描新增的串口输出：
+
+- `SERIAL_FATAL`（错误）：`XHYPER PANIC`、`XHYPER_PANIC_HOLD`（虚拟化层的 panic 处理）、`MANAGER_FATAL`、`XHYPER_*ERROR`、`Kernel panic`，以及引导程序记录的上次复位原因（`exception_reboot_reason`、`exception_panic_reason`、`wdt fiq`）；
+- `SERIAL_STALE`（警告）：两次检查之间串口没有任何输出（抓取停了，或者转接头、飞线断开）。
+
+出现意外重启、失联、致命标记时，把事发前约 10 分钟到当前的串口内容另存为 `serial-NNN-<原因>.txt`。
+
 ## 故障分类
 
 - **错误（任何一个都判 FAIL）**：`UNEXPECTED_REBOOT`（开机号在计划外改变，附开机原因和 pstore）、`DEVICE_GONE`（`lost_timeout_s` 内连不上，要人去看）、`BOOT_FAIL`、`RESUME_TIMEOUT`、`SUSPEND_FAIL`（睡眠失败计数增加）、`KERNEL_BAD`（新的 oops、锁死、RCU 停顿、看门狗、`WARNING: CPU` 行）、`STRESS_FAIL`、`MEMTEST_FAIL`、`IDENTITY_MISMATCH`、`MONITOR_FAIL`。

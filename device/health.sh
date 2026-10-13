@@ -1,9 +1,11 @@
 #!/system/bin/sh
-# health.sh: one health snapshot of an Android device, run as root (`su 0 sh health.sh`).
+# health.sh [marker]: one health snapshot of an Android device, run as root (`su 0 sh health.sh`).
 # Prints key=value lines first (parsed by host/stab.py), then raw sections between "--- <name>" markers.
 # Everything here is read-only.
 
 kv() { echo "$1=$2"; }
+# Optional marker: written to the kernel log, so it also appears on the serial console and aligns the two timelines.
+[ -n "${1:-}" ] && echo "STAB $1" > /dev/kmsg
 kv boot_id "$(cat /proc/sys/kernel/random/boot_id)"
 kv uptime "$(cut -d' ' -f1 /proc/uptime)"
 kv epoch "$(date +%s)"

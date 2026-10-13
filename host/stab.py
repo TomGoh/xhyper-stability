@@ -19,9 +19,9 @@ import el2_report  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
-ERRORS = {'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
+ERRORS = {'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
+WARNINGS = {'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
 
 
@@ -76,8 +76,8 @@ class Device:
             time.sleep(5)
         return False
 
-    def health(self):
-        rc, out = self.su(f'sh {DEV}/health.sh', timeout=90)
+    def health(self, marker=''):
+        rc, out = self.su(f'sh {DEV}/health.sh {shlex.quote(marker)}' if marker else f'sh {DEV}/health.sh', timeout=90)
         if rc != 0 or 'boot_id=' not in out:
             return None
         h, sec, name = {'_raw': out}, collections.defaultdict(list), None
@@ -94,6 +94,11 @@ class Device:
         return h
 
 
+# Fatal markers on the serial console (Linux console and the hypervisor console share the UART on T11206): the
+# hypervisor's panic handler (core/kruntime/src/lang_items.rs prints 'XHYPER PANIC:' then 'XHYPER_PANIC_HOLD'), the
+# Manager's fatal stop, hypervisor boot errors, a Linux panic, and the boot loader's record of the previous reset.
+SERIAL_FATAL = re.compile(rb'XHYPER PANIC|XHYPER_PANIC_HOLD|MANAGER_FATAL|XHYPER_[A-Z_]*ERROR|Kernel panic|'
+                          rb'exception_reboot_reason|exception_panic_reason|wdt fiq')
 KERNEL_ERROR = re.compile(r'BUG:|Oops|Unable to handle|soft lockup|hard LOCKUP|rcu.*(stall|self-detected)|'
                           r'blocked for more than|Kernel panic|SError|synchronous external abort|Unhandled')
 
@@ -183,6 +188,11 @@ class Run:
         self.el2_order = []
         self.el2_counts = collections.Counter()
         self.scanner = None
+        self.serial = None          # path of a serial capture's line file (host-stamped), written by another process
+        self.serial_scan_off = 0
+        self.serial_marks = []      # (epoch, file size) at each snapshot
+        self.serial_stale = False
+        self.nserial = 0
 
     # ------------------------------------------------------------------ records
     def event(self, kind, msg='', **kw):
@@ -199,7 +209,10 @@ class Run:
 
     # ------------------------------------------------------------------ health
     def snapshot(self, tag=''):
-        h = self.dev.health()
+        h = self.dev.health(f'{self.phase} {self.nsnap + 1} {tag}'.strip())
+        if self.serial:
+            self.serial_marks.append((time.time(), os.path.getsize(self.serial) if os.path.exists(self.serial) else 0))
+            self.serial_marks = self.serial_marks[-50:]
         if h is None:
             return self.lost(tag)
         self.nsnap += 1
@@ -254,6 +267,7 @@ class Run:
         self.event('DEVICE_LOST', f'no adb/health answer ({tag}); waiting up to {self.lost_timeout} s')
         t0 = time.time()
         if not self.dev.wait_alive(self.lost_timeout):
+            self.serial_extract('device-gone')
             self.event('DEVICE_GONE', f'not back after {self.lost_timeout} s: hung or powered off; a person must look '
                        '(power button, serial console)')
             raise Abort('device gone')
@@ -262,6 +276,7 @@ class Run:
             self.event('BOOT_FAIL', 'adb back but sys.boot_completed never became 1 within 400 s')
             raise Abort('boot did not complete')
         self.event('INFO', f'device back after {back:.0f} s')
+        self.serial_extract('device-lost')
         h = self.dev.health()
         if h is None:
             self.event('DEVICE_GONE', 'back on adb but health snapshot fails'); raise Abort('health fails')
@@ -283,13 +298,50 @@ class Run:
             if m:
                 hint = f'{f}: {m.group(1)[:160]}'
                 break
+        self.serial_extract('unexpected-reboot')
         self.event('UNEXPECTED_REBOOT', f"boot_id {prev['boot_id'][:8]} -> {h['boot_id'][:8]}; sys.boot.reason="
                    f"{h.get('boot_reason')} history={h.get('boot_reason_last')} bootloader={h.get('bootloader_reason')}"
                    f"; pstore {' '.join(files)} saved to {os.path.basename(d)}; {hint}")
 
+    def serial_extract(self, why, before_s=600, cap=30 << 20):
+        """Serial lines from about before_s seconds before now to the end of the capture, into serial-NNN-<why>.txt."""
+        if not self.serial or not os.path.exists(self.serial):
+            return
+        end = os.path.getsize(self.serial)
+        start = next((off for t, off in reversed(self.serial_marks) if t <= time.time() - before_s),
+                     self.serial_marks[0][1] if self.serial_marks else max(0, end - cap))
+        start = max(start, end - cap)
+        self.nserial += 1
+        name = f'serial-{self.nserial:03d}-{why}.txt'
+        with open(self.serial, 'rb') as f, open(os.path.join(self.out, name), 'wb') as o:
+            f.seek(start); o.write(f.read(end - start))
+        self.event('INFO', f'serial window saved: {name} ({(end - start) >> 10} KiB)')
+
+    def serial_scan(self):
+        if not self.serial or not os.path.exists(self.serial):
+            return
+        end = os.path.getsize(self.serial)
+        if end == self.serial_scan_off:
+            if not self.serial_stale:
+                self.serial_stale = True
+                self.event('SERIAL_STALE', f'no serial output since the last check ({self.serial}): capture stopped or '
+                           'the adapter/wires are off')
+            return
+        self.serial_stale = False
+        with open(self.serial, 'rb') as f:
+            f.seek(self.serial_scan_off)
+            chunk = f.read(end - self.serial_scan_off)
+        self.serial_scan_off = end
+        hits = [l for l in chunk.splitlines() if SERIAL_FATAL.search(l)]
+        for l in hits[:10]:
+            self.event('SERIAL_FATAL', l.decode('utf-8', 'replace')[:300])
+        if hits:
+            self.serial_extract('serial-fatal')
+
     def checkpoint(self, tag=''):
         if time.time() >= self.next_check:
             self.snapshot(tag)
+            self.serial_scan()
             if self.el2:
                 self.el2_pull_scan()
             self.next_check = time.time() + self.interval
@@ -371,6 +423,9 @@ class Run:
         if expect_sha and not sha.startswith(expect_sha):
             self.event('IDENTITY_MISMATCH', f'boot_a {sha[:16]} is not the expected {expect_sha}')
             raise Abort('identity mismatch')
+        if self.serial:
+            self.serial_scan_off = os.path.getsize(self.serial) if os.path.exists(self.serial) else 0
+            self.event('INFO', f'serial capture {self.serial} from byte {self.serial_scan_off}')
         self.snapshot('baseline')
         if self.el2:
             self.el2_setup()
@@ -600,6 +655,10 @@ class Run:
             self.event('ABORT', 'interrupted')
         finally:
             self.dev.sh('pkill -f com.android.commands.monkey', timeout=20)
+            try:
+                self.serial_scan()
+            except Exception as e:
+                self.event('SERIAL_STALE', f'final serial scan failed: {e!r}')
             if self.el2:
                 try:
                     self.el2_pull_scan()
@@ -640,6 +699,9 @@ def main():
     r.add_argument('--plan', required=True)
     r.add_argument('--out', required=True)
     r.add_argument('--expect-boot-sha', default='')
+    r.add_argument('--serial-log', default='',
+                   help='line file of a serial capture running alongside (e.g. tools/perf/t11206-serial-capture.sh '
+                        'writes serial.txt): scanned for fatal markers, windows saved on resets and losses')
     r.add_argument('--no-el2', action='store_true',
                    help='ignore the plan\'s el2_monitor (an image without the hypervisor, e.g. the stock baseline)')
     rp = sub.add_parser('report')
@@ -655,6 +717,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     dev = Device(a.serial)
     run = Run(dev, a.out, plan)
+    run.serial = a.serial_log or None
     def on_term(*_):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, on_term)
