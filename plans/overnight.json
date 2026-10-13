@@ -1,5 +1,5 @@
 {
-  "name": "overnight: reboots, mixed use with hypervisor-path stress, forced suspend cycles, memory test, latency, screen-off standby (about 10.5 hours; start after 21:00)",
+  "name": "overnight: reboots, mixed use with music and hypervisor-path stress, forced suspend cycles, memory test, latency, EL2 torture by exit class (two rounds), screen-off standby (about 10 hours; start after 21:00)",
   "health_interval_s": 300,
   "lost_timeout_s": 900,
   "el2_monitor": {
@@ -15,7 +15,7 @@
     },
     {
       "type": "soak",
-      "minutes": 210,
+      "minutes": 150,
       "throttle_ms": 300,
       "packages": [
         "com.android.launcher3",
@@ -60,8 +60,31 @@
       "stress_args": "--cpu 4 --switch 2 --timer 2 --affinity 2"
     },
     {
+      "type": "el2_stress",
+      "seconds": 300,
+      "steps": [
+        "ipi",
+        "timer",
+        "idle",
+        "traffic",
+        "affinity",
+        "hotplug",
+        "pmu",
+        "all",
+        "ipi",
+        "timer",
+        "idle",
+        "traffic",
+        "affinity",
+        "hotplug",
+        "pmu",
+        "all"
+      ],
+      "note": "one exit class per step (device/el2stress.sh), two rounds; late in the night: a hang here can only cost the standby phase"
+    },
+    {
       "type": "standby",
-      "hours": 3,
+      "hours": 2,
       "suspend_s": 1500,
       "awake_s": 30
     }
