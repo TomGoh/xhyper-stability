@@ -750,7 +750,9 @@ class Run:
             if step == 'pmu' and self.el2:  # the monitor owns the PMU while it counts
                 self.dev.su('echo 0 > /proc/xcore_stats', timeout=30)
             usb = None
-            if step in ('traffic', 'affinity', 'all'):  # USB bulk traffic: device-side USB controller interrupts
+            # USB bulk traffic: device-side USB controller interrupts. Not for a device behind a remote adb server
+            # (ADB_SERVER_SOCKET): the stream would cross the network tunnel too.
+            if step in ('traffic', 'affinity', 'all') and not os.environ.get('ADB_SERVER_SOCKET'):
                 usb = subprocess.Popen(['adb', '-s', self.dev.serial, 'exec-out',
                                         f'timeout {secs} cat /dev/zero'], stdout=subprocess.DEVNULL,
                                        stderr=subprocess.DEVNULL)
