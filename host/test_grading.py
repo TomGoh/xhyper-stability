@@ -4,6 +4,7 @@
   python3 -m unittest discover -s host -p 'test_*.py' -v
 """
 import contextlib, io, json, os, shutil, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare  # noqa: E402
@@ -404,9 +405,11 @@ class PhaseMarkers(RunCase):
         calls = []
         r.mark_phase, r.dismiss_anr_dialogs = lambda: calls.append(r.phase), lambda t: None
         r.wait = lambda s, t='': None
-        r.phase_el2_stress({'steps': ['ipi', 'timer'], 'seconds': 1})
-        self.assertEqual(calls, ['6-el2_stress/ipi', '6-el2_stress/timer', '6-el2_stress'])
-        self.assertEqual([e['phase'] for e in self.events('PHASE_START')], ['6-el2_stress/ipi', '6-el2_stress/timer'])
+        r.phase_el2_stress({'steps': ['ipi', 'timer', 'ipi'], 'seconds': 1})
+        steps = ['6-el2_stress/ipi', '6-el2_stress/timer', '6-el2_stress/ipi-r2']
+        self.assertEqual(calls, steps + ['6-el2_stress'])
+        self.assertEqual([e['phase'] for e in self.events('PHASE_START')], steps)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, 'el2stress-ipi-r2.txt')))
 
 
 def trusty(i, phase_f=1000.0):
@@ -607,6 +610,70 @@ class SmallFixes(RunCase):
         r.serial = self.capture(serial_lines(3895.0, 3895.6, 2000))
         r.snapshot('baseline'); r.snapshot(); r.snapshot()
         self.assertEqual([e['kind'] for e in self.events('KERNEL_BAD', 'KERNEL_WARN')], ['KERNEL_BAD'])
+
+
+RTC = '64400000.spi:pmic@0:rtc@200'
+
+
+class Standby(RunCase):
+    """Rule 6: standby runs for its hours, records each wake source and flags sleeps cut short."""
+
+    def test_summary_short(self):
+        info, short = stab.standby_summary([(12, RTC), (9, RTC), (17, RTC), (11, '26100000.pcie')], 1500)
+        self.assertIn(f'4 cycles of 1500 s requested; adb back after median 12 s, max 17 s; wake reasons {RTC} x3',
+                      info)
+        self.assertRegex(short, rf'^woke after a median 12 s of the requested 1500 s \({RTC}\): long standby not '
+                                'measured')
+
+    def test_summary_long_or_never(self):
+        self.assertIsNone(stab.standby_summary([(1512, RTC), (1530, RTC)], 1500)[1])
+        info, short = stab.standby_summary([(None, 'unknown')], 1500)
+        self.assertIsNone(short)
+        self.assertIn('never', info)
+
+    def test_wake_reason_in_cycle_line(self):
+        rtc = f'[  120.000000] Resume caused by IRQ 104, {RTC}'
+        r = self.run_of(H(dmesg_last=100), H(suspend_success=1, wakeup_reason=rtc), su_out='AUDIO 0 0')
+        r.dev.wait_drop = lambda timeout: True
+        with mock.patch.object(stab.time, 'sleep'):
+            h, back, why = r.suspend_once(20, 1)
+        self.assertEqual(why, RTC)
+        self.assertRegex(self.events('INFO')[-1]['msg'], rf'^suspend 1: success \+1 fail \+0, adb back after \d+ s, '
+                                                         rf'woke by {RTC}$')
+
+    def test_first_resume_and_refused_suspend(self):
+        """The first resume after the pre-suspend snapshot is ours (a later one can be an automatic suspend's); a
+        suspend that never dropped adb has no sleep length."""
+        sec = [f'[  120.000000] Resume caused by IRQ 104, {RTC}',
+               '[  150.000000] Resume caused by misconfigured IRQ 127 26100000.pcie wakeup']
+        r = self.run_of(H(dmesg_last=100), H(kernel=sec, suspend_success=1), su_out='AUDIO 0 0')
+        r.dev.wait_drop = lambda timeout: False
+        with mock.patch.object(stab.time, 'sleep'):
+            h, back, why = r.suspend_once(20, 1)
+        self.assertEqual((back, why), (None, RTC))
+        self.assertIn('adb never dropped, woke by', self.events('INFO')[-1]['msg'])
+        self.assertIn('median 12 s', stab.standby_summary([(12, RTC), (None, RTC), (12, RTC)], 1500)[0])
+
+    def run_standby(self, back):
+        clock = [1000.0]
+        r = self.run_of()
+        calls = []
+
+        def once(s, i):
+            calls.append(i); clock[0] += back + 30
+            return {}, back, RTC
+        r.suspend_once, r.screen = once, lambda on: None
+        with mock.patch.object(stab.time, 'time', lambda: clock[0]), mock.patch.object(stab.time, 'sleep'):
+            r.phase_standby({'hours': 0.05, 'suspend_s': 1500, 'awake_s': 30})  # 180 s
+        return calls
+
+    def test_loops_for_the_hours(self):
+        self.assertEqual(len(self.run_standby(12)), 5)  # 42 s a cycle: starts at 0, 42, 84, 126, 168 of 180 s
+        self.assertEqual(len(self.events('STANDBY_SHORT')), 1)
+        self.reset()
+        self.assertEqual(self.run_standby(1510), ['standby1'])
+        self.assertEqual(self.events('STANDBY_SHORT'), [])
+        self.assertIn('1 cycles of 1500 s requested', self.events('INFO')[-1]['msg'])
 
 
 if __name__ == '__main__':

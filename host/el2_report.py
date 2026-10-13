@@ -142,6 +142,13 @@ def phases(run_dir):
     return sorted(out)
 
 
+def phase_of(phs, ep):
+    """Innermost phase holding epoch ep: of the (start, end, name) intervals that contain it, the latest start (on a
+    tie the earliest end), so an el2_stress step gets its samples, not the run phase around it; '-' when none."""
+    hold = [(s, -e, n) for s, e, n in phs if s <= ep <= e]
+    return max(hold)[2] if hold else '-'
+
+
 def report(run_dir):
     pmap = policy_map(run_dir)
     phs = phases(run_dir) if os.path.exists(os.path.join(run_dir, 'events.jsonl')) else []
@@ -152,7 +159,7 @@ def report(run_dir):
     for path in sorted(glob.glob(os.path.join(run_dir, 'el2', '*.log'))):
         boot, last = os.path.basename(path)[:-4], {}
         for _, bt, ep, fr, cpus in blocks(path):
-            ph = next((n for s, e, n in phs if s <= ep <= e), '-')
+            ph = phase_of(phs, ep)
             for c, (cy, ts) in sorted(cpus.items()):
                 if c in last and ts > last[c][1] and cy >= last[c][0] and fr:
                     f = fr[min(pmap.get(c, 0), len(fr) - 1)] * 1000

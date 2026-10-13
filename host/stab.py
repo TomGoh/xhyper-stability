@@ -14,7 +14,7 @@ attributed by their kernel time to the phase they happened in (a `STAB PHASE_STA
 phase start), not to the snapshot that collected them. Every event goes to events.jsonl and log.txt; summary.md is
 (re)written at the end, also after Ctrl-C or an abort. Python 3 stdlib only.
 """
-import argparse, collections, json, os, re, shlex, signal, subprocess, sys, time
+import argparse, collections, json, os, re, shlex, signal, statistics, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import el2_report  # noqa: E402
@@ -23,7 +23,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
 ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'PROBE_TIMEOUT', 'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
+WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'STANDBY_SHORT', 'DEVICE_LOST', 'PROBE_TIMEOUT', 'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
 
 
@@ -310,6 +310,38 @@ def wake_lines(h):
     kv = (h.get('wakeup_reason') or '').split(' | ')
     sec = [l for l in h['_sec'].get('kernel_bad', []) if 'Resume caused by' in l or 'Wakeup pending' in l]
     return sec + [p for p in kv if p.startswith('last_resume_reason')] if sec else kv
+
+
+def wake_source(h, prev):
+    """What ended a forced suspend: the device of the first resume line since the previous snapshot (a later one can
+    be an automatic suspend's), else 'unknown'."""
+    return wake_info(wake_lines(h), since=fnum(prev, 'dmesg_last'))[1] or 'unknown'
+
+
+def standby_summary(cycles, suspend_s):
+    """(INFO text, STANDBY_SHORT text or None) of a standby phase; cycles = [(seconds until adb came back or None,
+    wake source)]. Short when the median is below half the requested suspend: with USB power connected the charger
+    driver arms a wake alarm a few seconds ahead on every suspend (T11206, stock too, 2026-10-14)."""
+    backs = sorted(b for b, _ in cycles if b is not None)
+    why = collections.Counter(w for _, w in cycles)
+    med = statistics.median(backs) if backs else None
+    info = (f'standby: {len(cycles)} cycles of {suspend_s} s requested; adb back after median '
+            + (f'{med:.0f} s, max {backs[-1]:.0f} s' if backs else '- (never)')
+            + '; wake reasons ' + (', '.join(f'{w} x{n}' for w, n in why.most_common()) or '-'))
+    if med is None or med >= suspend_s / 2:
+        return info, None
+    return info, (f'woke after a median {med:.0f} s of the requested {suspend_s} s ({why.most_common(1)[0][0]}): long '
+                  'standby not measured; with USB power connected the charger driver arms a wake timer of a few seconds '
+                  'on every suspend')
+
+
+def step_names(steps):
+    """Phase name of each el2_stress step: a repeated step is <step>-r2, -r3, ... (the first keeps the plain name)."""
+    n, out = collections.Counter(), []
+    for s in steps:
+        n[s] += 1
+        out.append(s if n[s] == 1 else f'{s}-r{n[s]}')
+    return out
 
 
 def attribute(marks, boot, t):
@@ -947,6 +979,8 @@ class Run:
             self.screen(True)
 
     def suspend_once(self, sleep_s, i):
+        """One forced suspend; returns (snapshot after it, seconds until adb came back, wake source); the seconds are
+        None when adb never dropped (suspend refused, or adb survived it) or never came back."""
         h0 = self.snapshot(f'pre-suspend{i}')
         s0, f0 = num(h0, 'suspend_success'), num(h0, 'suspend_fail')
         self.screen(False)
@@ -954,20 +988,23 @@ class Run:
         t0 = time.time()
         # Detached: USB and adb drop while the device sleeps, so the command must not depend on the adb session.
         self.dev.su(f'nohup rtcwake -m mem -s {sleep_s} > {DEV}/rtcwake.log 2>&1 &', timeout=20)
-        if not self.dev.wait_drop(30):  # still on adb: the suspend was refused or adb survived it
+        dropped = self.dev.wait_drop(30)
+        if not dropped:  # still on adb: the suspend was refused or adb survived it
             time.sleep(sleep_s + 5)
         if not self.dev.wait_alive(sleep_s + 180):
             self.event('RESUME_TIMEOUT', f'suspend {i}: no adb {sleep_s + 180} s after a {sleep_s} s alarm')
-            return self.snapshot(f'suspend{i}-late')
-        back = time.time() - t0
+            return self.snapshot(f'suspend{i}-late'), None, 'unknown'
+        back = time.time() - t0 if dropped else None
         h = self.snapshot(f'suspend{i}')
         ds, df = num(h, 'suspend_success') - s0, num(h, 'suspend_fail') - f0
         if h.get('boot_id') != h0.get('boot_id'):
-            return h
+            return h, back, 'reboot'
         if ds < 1 and df < 1:
             self.event('SUSPEND_NOT_ENTERED', f'suspend {i}: success +{ds}, fail +{df} (aborted before suspend?)')
-        self.event('INFO', f'suspend {i}: success +{ds} fail +{df}, adb back after {back:.0f} s')
-        return h
+        why = wake_source(h, h0)
+        came = f'adb back after {back:.0f} s' if back is not None else 'adb never dropped'
+        self.event('INFO', f'suspend {i}: success +{ds} fail +{df}, {came}, woke by {why}')
+        return h, back, why
 
     def wait_audio_idle(self, least=5, most=15):
         """Screen off plays the lock sound (about 3 s on T11206). A forced suspend (rtcwake ignores wake locks) that
@@ -1016,12 +1053,19 @@ class Run:
             self.event('INFO', 'stressapptest PASS')
 
     def phase_standby(self, p):
-        cycles = max(1, int(p['hours'] * 3600 / (p.get('suspend_s', 1500) + 60)))
-        for i in range(1, cycles + 1):
-            self.suspend_once(p.get('suspend_s', 1500), f'standby{i}')
+        """Forced suspends of suspend_s each until `hours` have passed (a cycle starts while time is left), then the
+        real sleep lengths (seconds until adb came back) and wake sources: STANDBY_SHORT when they were cut short."""
+        end, s, cycles = time.time() + p['hours'] * 3600, p.get('suspend_s', 1500), []
+        while time.time() < end:
+            _, back, why = self.suspend_once(s, f'standby{len(cycles) + 1}')
+            cycles.append((back, why))
             self.screen(True)
             time.sleep(p.get('awake_s', 30))
         self.screen(True)
+        info, short = standby_summary(cycles, s)
+        self.event('INFO', info)
+        if short:
+            self.event('STANDBY_SHORT', short)
 
     def phase_latency(self, p):
         if not self.tool('cyclictest'):
@@ -1046,9 +1090,11 @@ class Run:
         base, secs = self.phase, int(p.get('seconds', 180))
         if any(s_ in ('gpu', 'all') for s_ in p.get('steps', [])):
             self.ensure_apks(['glmark2'])
-        for step in p.get('steps', ['ipi', 'timer', 'idle', 'traffic', 'affinity', 'hotplug', 'pmu', 'all']):
-            self.phase = f'{base}/{step}'
-            self.event('PHASE_START', f'{step} {secs} s')
+        steps = p.get('steps', ['ipi', 'timer', 'idle', 'traffic', 'affinity', 'hotplug', 'pmu', 'all'])
+        # a repeated step runs as <step>-r2, ...: its own phase, events, files and EL2 summary row
+        for step, name in zip(steps, step_names(steps)):
+            self.phase = f'{base}/{name}'
+            self.event('PHASE_START', f'{name} {secs} s')
             self.mark_phase()
             t0 = time.time()
             soff = os.path.getsize(self.serial) if self.serial and os.path.exists(self.serial) else 0
@@ -1063,34 +1109,34 @@ class Run:
                                        stderr=subprocess.DEVNULL)
             self.dev.su(f'nohup sh {DEV}/el2stress.sh {step} {secs} {gw} > {DEV}/tmp/el2stress-{step}.log 2>&1 &',
                         timeout=30)
-            self.wait(secs, step)
+            self.wait(secs, name)
             out, end = '', time.time() + 300
             while time.time() < end:
                 _, out = self.dev.su(f'cat {DEV}/tmp/el2stress-{step}.log', timeout=30)
                 if f'EL2STRESS_DONE {step}' in out:
                     break
-                self.checkpoint(step)
+                self.checkpoint(name)
                 time.sleep(10)
             if usb:
                 usb.kill()
-            self.dismiss_anr_dialogs(step)
-            self.save(f'el2stress-{step}.txt', out)
+            self.dismiss_anr_dialogs(name)
+            self.save(f'el2stress-{name}.txt', out)
             if f'EL2STRESS_DONE {step}' not in out:
-                self.event('STRESS_FAIL', f'{step}: no EL2STRESS_DONE within {secs + 300} s')
-                self.snapshot(f'{step}-late')
+                self.event('STRESS_FAIL', f'{name}: no EL2STRESS_DONE within {secs + 300} s')
+                self.snapshot(f'{name}-late')
             for l in out.splitlines():
                 if l.startswith('EL2STRESS ') and ' rc=' in l and not re.search(r' rc=0\b', l):
-                    self.event('STRESS_FAIL', f'{step}: {l[:200]}')
+                    self.event('STRESS_FAIL', f'{name}: {l[:200]}')
             parts = ' | '.join(l[10 + len(step):].strip() for l in out.splitlines()
                                if l.startswith(f'EL2STRESS {step} '))
-            self.event('INFO', f'{step}: {parts[:400]}')
+            self.event('INFO', f'{name}: {parts[:400]}')
             if step == 'pmu' and self.el2:
                 self.el2_up()
             if self.serial and os.path.exists(self.serial):
                 with open(self.serial, 'rb') as f:
                     f.seek(soff)
                     hv = [l for l in f.read().splitlines() if b'XHYPER_' in l]
-                with open(os.path.join(self.out, f'el2stress-{step}-serial.txt'), 'wb') as o:
+                with open(os.path.join(self.out, f'el2stress-{name}-serial.txt'), 'wb') as o:
                     o.write(b'\n'.join(hv) + b'\n')
                 last = {}
                 for l in hv:
@@ -1098,14 +1144,14 @@ class Run:
                     if mm:
                         last[mm.group(1).decode()] = l.decode('utf-8', 'replace')
                 keep = [v for k, v in last.items() if k.endswith(('_INPLACE', '_COUNTS', 'IDLE_WAKE', 'REFUSED'))]
-                self.event('INFO', f'{step}: hypervisor counters at end: ' + ' || '.join(x[13:200] for x in keep)[:900])
+                self.event('INFO', f'{name}: hypervisor counters at end: ' + ' || '.join(x[13:200] for x in keep)[:900])
             if self.el2:
                 self.el2_pull_scan()
                 w = el2_report.window(self.out, t0 + 5, time.time())
                 if w:
-                    self.event('EL2_LOAD', f'{step}: EL2 share mean/max per CPU ' +
+                    self.event('EL2_LOAD', f'{name}: EL2 share mean/max per CPU ' +
                                ' '.join(f'{c}:{m_:.0%}/{x:.0%}' for c, (m_, x, _) in w.items()))
-            self.event('PHASE_END', step)
+            self.event('PHASE_END', name)
         self.phase = base
         self.mark_phase()  # back in the outer phase: later kernel lines are not the last step's
 
