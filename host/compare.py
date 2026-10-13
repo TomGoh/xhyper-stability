@@ -2,26 +2,39 @@
 """compare.py LABEL=RUN_DIR ...: side-by-side table of stability runs (e.g. the hypervisor image against stock).
 
 Per run: verdict, event counts by kind, kernel findings grouped by source (the 'at <file>:<line>' of WARNING splats,
-the task of long preempt-off reports), suspend results, stress/memtest outcomes, cyclictest maximum latency per CPU
-(idle and loaded). Prints markdown; with --out FILE also writes it there.
+the report type and task of long preempt-off and IRQ-off reports; aggregated events add their `count`), suspend
+results, stress/memtest outcomes, cyclictest maximum latency per CPU (idle and loaded). Prints markdown; with
+--out FILE also writes it there.
 """
 import collections, json, os, re, sys
 
 
 def load(d):
     evs = [json.loads(l) for l in open(os.path.join(d, 'events.jsonl')) if l.strip()]
-    r = {'kinds': collections.Counter(e['kind'] for e in evs)}
+    r = {'kinds': collections.Counter()}
     src = collections.Counter()
     for e in evs:
+        n = e.get('count', 1)  # an aggregated event stands for `count` findings
+        r['kinds'][e['kind']] += n
         if e['kind'] in ('KERNEL_BAD', 'KERNEL_WARN'):
             m = re.search(r'WARNING: CPU: \d+ PID: \d+ at (\S+)', e['msg'])
-            p = re.search(r'preemptoff_warn: C\d+ T:<\d+>(\S+) D:([0-9.]+)ms', e['msg'])
+            # preempt/IRQ-off reports by report type and task (digits as N): from `group` ('<preemptoff|irqsoff> <task>
+            # <reason class>', runs since 2026-10-14), else parsed from the line
+            g = e.get('group', '')
+            p = re.search(r'(preemptoff|irqsoff)_warn: C\d+ T:<\d+>(.*?) D:\s*(\d+(?:\.\d+)?)\s*ms', e['msg'])
+            if g.count(' ') >= 2:  # the task name can hold spaces ('Signal Catcher')
+                t, rest = g.split(' ', 1)
+                comm, cls = rest.rsplit(' ', 1)
+                off = (t, comm, cls != 'short')
+            else:
+                off = (p.group(1), re.sub(r'[0-9]+', 'N', p.group(2)), float(p.group(3)) >= 100) if p else None
             if m:
-                src[f"{e['kind']} WARN {m.group(1)}"] += 1
-            elif p and float(p.group(2)) >= 100:
-                src[f"{e['kind']} preempt-off >=100ms {p.group(1)}"] += 1
-            elif not p:
-                src[f"{e['kind']} {re.sub(r'^\[\s*[0-9.]+\]\s*', '', e['msg'])[:64]}"] += 1
+                src[f"{e['kind']} WARN {m.group(1)}"] += n
+            elif off and off[2]:
+                src[f"{e['kind']} {'preempt-off' if off[0] == 'preemptoff' else 'irq-off'} >=100ms {off[1]}"] += n
+            elif not off:
+                msg = re.sub(r' \[[^\]]*\]$', '', re.sub(r' \(collected in [^)]*\)$', '', e['msg']))
+                src[f"{e['kind']} {re.sub(r'^\[\s*[0-9.]+\]\s*', '', msg)[:64]}"] += n
     r['kernel'] = src
     r['suspend'] = collections.Counter(
         'ok' if re.search(r'success \+1 fail \+0', e['msg']) else 'other'

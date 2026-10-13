@@ -58,13 +58,18 @@ python3 host/stab.py report <输出目录>      # 重新生成 summary.md
 - `SERIAL_FATAL`（错误）：`XHYPER PANIC`、`XHYPER_PANIC_HOLD`（虚拟化层的 panic 处理）、`MANAGER_FATAL`、`XHYPER_*ERROR`、`Kernel panic`，以及引导程序记录的上次复位原因（`exception_reboot_reason`、`exception_panic_reason`、`wdt fiq`）；
 - `SERIAL_STALE`（警告）：两次检查之间串口没有任何输出（抓取停了，或者转接头、飞线断开）。
 
+主机还按内核时间统计串口每 0.1 秒输出的字节数（只统计当前这次开机，保留最近 2 小时），给关抢占、关中断报告定级用（见下节）。
+
 出现意外重启、失联、致命标记时，把事发前约 10 分钟到当前的串口内容另存为 `serial-NNN-<原因>.txt`。
 
 ## 故障分类
 
-- **错误（任何一个都判 FAIL）**：`UNEXPECTED_REBOOT`（开机号在计划外改变，附开机原因和 pstore）、`DEVICE_GONE`（`lost_timeout_s` 内连不上，要人去看）、`BOOT_FAIL`、`RESUME_TIMEOUT`、`SUSPEND_FAIL`（睡眠失败计数增加）、`KERNEL_BAD`（新的 oops、锁死、RCU 停顿、看门狗、`WARNING: CPU` 行）、`STRESS_FAIL`、`MEMTEST_FAIL`、`IDENTITY_MISMATCH`、`MONITOR_FAIL`。
+- **错误（任何一个都判 FAIL）**：`UNEXPECTED_REBOOT`（开机号在计划外改变，附开机原因和 pstore）、`DEVICE_GONE`（`lost_timeout_s` 内连不上，要人去看；设备在线但健康快照一直失败也算）、`BOOT_FAIL`、`RESUME_TIMEOUT`、`SUSPEND_FAIL`（睡眠失败计数增加）、`KERNEL_BAD`（新的 oops、锁死、RCU 停顿、看门狗、`WARNING: CPU` 行）、`STRESS_FAIL`、`MEMTEST_FAIL`、`IDENTITY_MISMATCH`、`MONITOR_FAIL`。
 - 重启和唤醒后比较设备清单（PCI、USB、声卡、网络接口、输入设备），少了任何一项记 `DEVICE_MISSING`（错误）；dropbox 里崩溃、无响应、看门狗记录增加记警告。
-- **警告**：`DEVICE_LOST`（暂时失联又回来了）、应用崩溃、无响应、墓碑文件、`SUSPEND_NOT_ENTERED`（睡眠在进入前被放弃）、`SKIP`（工具缺失，或者某个压力项在这台设备上不能运行）。
+- **警告**：`DEVICE_LOST`（暂时失联又回来了）、`PROBE_TIMEOUT`（健康快照超时，但 60 秒内 adb 就答复了，开机号没变：满负载下快照本身太慢；随即重拍一次，重拍也失败就记 `DEVICE_GONE` 并中止）、`KERNEL_LOG_CAPPED`（两次快照之间值得看的内核行超过 2000 行，只读了最新的 2000 行）、`HEALTH_DEGRADED`（设备上 `/data` 满了或不可写、或没有 awk，`health.sh` 退回每次只读最后 200 行内核行；每次开机报一次）、应用崩溃、无响应、墓碑文件、`SUSPEND_NOT_ENTERED`（睡眠在进入前被放弃）、`SUSPEND_ABORTED`（闹钟 2 秒内到期，或者冻结各核时有具名设备的唤醒中断待处理；按设备名判，不按中断号）、`SKIP`（工具缺失，或者某个压力项在这台设备上不能运行）。
+- 厂商的关抢占、关中断报告（`preemptoff_warn`、`irqsoff_warn`，`D` 是时长）：100 毫秒以下记警告；100 毫秒及以上记 `KERNEL_BAD`，以下三种情况除外，降为警告并写明原因：串口同步打印所致（`[F - 0.2 秒, F + D]` 内打上的串口字节数不少于这段时间线路容量的一半，需要 `--serial-log`）；关抢占的区间落在另一个核的关中断区间里（跨核调用在等那个核，消息写明等的是哪次关中断，那次关中断自己照常定级）；与 `WARNING: CPU` 的打印重叠。
+- 内核日志里的问题按内核时间归到发生时所在的阶段或步骤：每个阶段开始时往内核日志写一行 `STAB PHASE_START <阶段>` 并读回它的内核时间；由后面阶段的快照收集到的，事件的阶段写发生时的那个，消息末尾注明 `(collected in <收集时的阶段>)`。
+- 同一次开机里，健康快照只读上次快照之后的内核行（`health.sh` 的第 2、3 个参数是上次的 `dmesg_last` 和开机号）。关抢占、关中断报告按（级别、报告类型、数字换成 N 的进程名、原因类别）分组，每个阶段每组前 3 条逐条记，其余每次快照每组记一条“N more like this”，事件带 `count`；`summary.md` 和 `compare.py` 按 `count` 累加，警告按类别各列前 20 条。
 - 出错后先在原厂镜像上用同一个计划复现：两边都有的是平台或厂商的问题，只在虚拟化层下出现的才归我们。
 
 ## 注意

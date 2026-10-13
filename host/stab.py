@@ -9,8 +9,10 @@ health snapshot (device/health.sh) at least every `health_interval_s`. Failures 
 because a hypervisor fault rarely leaves a trace inside Android: the device dropping off adb (DEVICE_LOST / DEVICE_GONE),
 a boot id that changed without a planned reboot (UNEXPECTED_REBOOT, with the boot reasons and the pstore files of the
 previous boot pulled), a boot that never completes (BOOT_FAIL); then Android-side findings (new kernel oops/lockup/
-watchdog lines, crash-buffer entries, ANRs, tombstones), stress-tool failures and suspend failures. Every event goes to
-events.jsonl and log.txt; summary.md is (re)written at the end, also after Ctrl-C or an abort. Python 3 stdlib only.
+watchdog lines, crash-buffer entries, ANRs, tombstones), stress-tool failures and suspend failures. Kernel lines are
+attributed by their kernel time to the phase they happened in (a `STAB PHASE_START` marker in the kernel log at every
+phase start), not to the snapshot that collected them. Every event goes to events.jsonl and log.txt; summary.md is
+(re)written at the end, also after Ctrl-C or an abort. Python 3 stdlib only.
 """
 import argparse, collections, json, os, re, shlex, signal, subprocess, sys, time
 
@@ -21,7 +23,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
 ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
+WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'PROBE_TIMEOUT', 'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
 
 
@@ -76,23 +78,33 @@ class Device:
             time.sleep(5)
         return False
 
-    def health(self, marker=''):
+    def health(self, marker='', since=None, boot=None):
+        """Parsed snapshot, or None; self.fail then says why: 'timeout' (no answer in 180 s) or the failure.
+        since, boot: the previous snapshot's dmesg_last and boot_id (only newer kernel lines on that boot)."""
+        args = ' '.join(shlex.quote(str(a)) for a in (marker, since or '', boot or ''))
         # 180 s: under the all-at-once EL2 stress a snapshot (dumpsys, logcat) took over 90 s on T11206 (2026-10-13)
-        rc, out = self.su(f'sh {DEV}/health.sh {shlex.quote(marker)}' if marker else f'sh {DEV}/health.sh', timeout=180)
+        rc, out = self.su(f'sh {DEV}/health.sh {args}', timeout=180)
         if rc != 0 or 'boot_id=' not in out:
+            self.fail = 'timeout' if rc is None else f'rc={rc}: ' + ' '.join(out.split())[-120:]
             return None
-        h, sec, name = {'_raw': out}, collections.defaultdict(list), None
-        for line in out.splitlines():
-            if line.startswith('--- '):
-                name = line[4:].strip()
-            elif name:
-                if line.strip():
-                    sec[name].append(line.rstrip())
-            elif '=' in line:
-                k, v = line.split('=', 1)
-                h[k.strip()] = v.strip()
-        h['_sec'] = dict(sec)
-        return h
+        self.fail = None
+        return parse_health(out)
+
+
+def parse_health(out):
+    """health.sh output -> {key: value, '_raw': out, '_sec': {section: [lines]}}."""
+    h, sec, name = {'_raw': out}, collections.defaultdict(list), None
+    for line in out.splitlines():
+        if line.startswith('--- '):
+            name = line[4:].strip()
+        elif name:
+            if line.strip():
+                sec[name].append(line.rstrip())
+        elif '=' in line:
+            k, v = line.split('=', 1)
+            h[k.strip()] = v.strip()
+    h['_sec'] = dict(sec)
+    return h
 
 
 # Fatal markers on the serial console (Linux console and the hypervisor console share the UART on T11206): the
@@ -126,7 +138,7 @@ def ko_load_order(d):
 
 
 def ktime(line):
-    m = re.match(r'\[\s*([0-9.]+)\]', line)
+    m = re.match(r'\[\s*(\d+(?:\.\d+)?)\]', line)
     return float(m.group(1)) if m else None
 
 
@@ -141,25 +153,170 @@ def printout_windows(lines):
     return out
 
 
-def kernel_kind(line, long_ms=100.0, windows=()):
-    """KERNEL_BAD for crashes, lockups, stalls; KERNEL_WARN for WARN_ON splats and short preempt-off reports; None for
-    the continuation lines of a report. preemptoff_warn is a vendor debug print (`D:<ms>` = how long preemption was off);
-    717 ms of it preceded the watchdog reset of 2026-10-12, so a long one stays an error."""
-    if KERNEL_ERROR.search(line):
-        return 'KERNEL_BAD'
-    m = re.search(r'preemptoff_warn: .* D:([0-9.]+)ms(?: F:([0-9.]+)s)?', line)
-    if m:
-        d = float(m.group(1)); f = float(m.group(2)) if m.group(2) else ktime(line) - d / 1000
-        if d < long_ms:
-            return 'KERNEL_WARN'
-        # Printing a splat to the synchronous serial console (loglevel 8, 921600 baud on T11206) keeps preemption off
-        # for most of a second; such an interval is a consequence of that warning, not a separate stall.
-        if any(f <= e + 0.1 and f + d / 1000 >= s0 for s0, e in windows):
-            return 'KERNEL_WARN'
-        return 'KERNEL_BAD'
-    if 'preemptoff_warn' in line or '---[ end trace' in line:
+OFF_REPORT = re.compile(r'\b(preemptoff|irqsoff)_warn: C(\d+) T:<\d+>(.*?) D:\s*(\d+(?:\.\d+)?)\s*ms'
+                        r'(?: F:(\d+(?:\.\d+)?)s)?')
+CONTEXT_LINE = re.compile(r'(preemptoff|irqsoff)_warn|---\[ end trace|Resume caused by|Wakeup pending')
+WAKE_IRQ = re.compile(r'Resume caused by (?:misconfigured )?IRQ \d+,? (\S+)')
+SERIAL_BPS = 92160      # bytes per second of the serial console: 921600 baud 8N1 (T11206)
+CONSOLE_SHARE = 0.5     # bytes stamped in [F - CONSOLE_LEAD, F + D] >= this share of what the line carries in D
+CONSOLE_LEAD = 0.2
+KERNEL_CAP = 2000       # health.sh KCAP: newest kernel lines per snapshot
+GROUP_FIRST = 3         # preempt/IRQ-off reports written one by one per (phase, group); the rest are counted
+REASON_CLASS = {'console-bound:': 'console', 'waits': 'wait', 'inside': 'splat'}  # first word of kernel_grade's why
+DEVICE_STEPS = ('prepare', 'suspend', 'suspend_late', 'suspend_noirq', 'resume_noirq', 'resume_early', 'resume')
+
+
+def parse_off(line):
+    """(kind, cpu, comm, D ms, start s) of a preemptoff_warn / irqsoff_warn report (vendor debug prints: preemption or
+    IRQs were off on CPU <cpu> for D ms from kernel time F); None for other lines, the '... at:' continuations too."""
+    m = OFF_REPORT.search(line)
+    if not m:
         return None
-    return 'KERNEL_WARN'
+    d, t = float(m.group(4)), ktime(line)
+    f = float(m.group(5)) if m.group(5) else (t - d / 1000 if t is not None else None)
+    return None if f is None else (m.group(1), int(m.group(2)), m.group(3), d, f)
+
+
+def irq_intervals(lines):
+    """(cpu, start, end, D ms, comm) of every irqsoff report among lines."""
+    return [(o[1], o[4], o[4] + o[3] / 1000, o[3], o[2]) for o in map(parse_off, lines) if o and o[0] == 'irqsoff']
+
+
+def waits_on(off, irqs, before=0.005, after=0.030):
+    """The longest irqsoff of another CPU whose interval holds this preempt-off (start >= its start - 5 ms, end <= its
+    end + 30 ms): a CPU spinning in a cross call (smp_call_function_single) for a CPU that has IRQs off; else None.
+    The IRQ-off CPU prints its own report (13 lines, ~10 ms at line rate) before it takes the IPI: overnight waiters
+    ended up to 24 ms after the irqsoff they waited on."""
+    _, cpu, _, d, f = off
+    hold = [i for i in irqs if i[0] != cpu and f >= i[1] - before and f + d / 1000 <= i[2] + after]
+    return max(hold, key=lambda i: i[3], default=None)
+
+
+class ConsoleHist:
+    """Bytes the serial console carried per 0.1 s of kernel time, for the current boot, from the host's line file
+    ('HH:MM:SS.mmm [ktime][caller] text'; kernel time = the first [...]; a line without one counts at the last time
+    seen). Fed incrementally (a partial last line waits for the next feed, up to PART_MAX bytes); keeps the last KEEP s
+    of kernel time; a time of 0 or more than BACK s behind the newest one is a new boot and starts over (the 0: after a
+    boot that ended within BACK s, the next one is never that far behind)."""
+    BIN, KEEP, BACK, PART_MAX = 0.1, 7200, 100, 1 << 16
+    HOST = re.compile(rb'\d\d:\d\d:\d\d\.\d{3} ')
+    KT = re.compile(rb'\[\s*([0-9]+\.[0-9]+)\]')
+
+    def __init__(self):
+        self.bins, self.part, self.top, self.cur, self.pruned = {}, b'', None, None, None
+
+    def feed(self, chunk):
+        lines = (self.part + chunk).split(b'\n')
+        self.part = lines.pop()
+        if len(self.part) > self.PART_MAX:  # no line end in sight: count it as a line
+            lines.append(self.part); self.part = b''
+        for l in lines:
+            h = self.HOST.match(l)
+            body = l[h.end():] if h else l
+            m = self.KT.match(body)
+            if m:
+                t = float(m.group(1))
+                if t == 0.0 or (self.top is not None and t < self.top - self.BACK):
+                    self.bins, self.top, self.pruned = {}, None, None
+                self.cur, self.top = t, (t if self.top is None else max(self.top, t))
+            if self.cur is None:
+                continue
+            k = int(self.cur / self.BIN)
+            self.bins[k] = self.bins.get(k, 0) + len(body.rstrip(b'\r')) + 2  # CR LF on the wire
+        if self.top is not None and (self.pruned is None or self.top - self.pruned > 60):
+            lo = int((self.top - self.KEEP) / self.BIN)
+            self.bins = {k: v for k, v in self.bins.items() if k >= lo}
+            self.pruned = self.top
+
+    def bytes_in(self, a, b):
+        """Bytes stamped in kernel time [a, b] (an edge bin counts by its overlap)."""
+        n = 0.0
+        for k in range(int(a / self.BIN), int(b / self.BIN) + 1):
+            v = self.bins.get(k)
+            if v:
+                n += v * max(0.0, min(b, (k + 1) * self.BIN) - max(a, k * self.BIN)) / self.BIN
+        return n
+
+
+def console_load(hist, f, d_ms):
+    """(bytes stamped in [F - 0.2 s, F + D], their share of what the serial line carries in D)."""
+    n = hist.bytes_in(f - CONSOLE_LEAD, f + d_ms / 1000)
+    return n, n / (max(d_ms, 0.001) / 1000 * SERIAL_BPS)
+
+
+def kernel_grade(line, long_ms=100.0, windows=(), irqs=(), hist=None):
+    """(kind, why) of a kernel line: KERNEL_BAD for crashes, lockups, stalls; KERNEL_WARN for WARN_ON splats and short
+    or explained preempt/IRQ-off reports; (None, '') for context lines (report continuations, resume reasons).
+    preemptoff_warn / irqsoff_warn are vendor debug prints (D = how long preemption / IRQs were off); 717 ms of
+    preempt-off preceded the watchdog reset of 2026-10-12, so one of long_ms or more stays an error unless explained:
+    - console-bound: the serial console is synchronous (921600 baud), so printing a burst keeps the printing CPU, and
+      CPUs spinning for the console, non-preemptible; bytes stamped in [F - 0.2 s, F + D] >= half the line's capacity
+      in D (hist: ConsoleHist of the capture; None without one);
+    - a preempt-off inside another CPU's irqsoff (irqs: irq_intervals of recent snapshots): it waited in a cross call;
+      the irqsoff is the finding and is graded by itself;
+    - inside a WARN splat printout (windows: printout_windows)."""
+    if KERNEL_ERROR.search(line):
+        return 'KERNEL_BAD', ''
+    off = parse_off(line)
+    if off:
+        kind, _, _, d, f = off
+        if d < long_ms:
+            return 'KERNEL_WARN', ''
+        if hist is not None:
+            n, share = console_load(hist, f, d)
+            if share >= CONSOLE_SHARE:
+                a, b = f - CONSOLE_LEAD, f + d / 1000
+                return 'KERNEL_WARN', (f'console-bound: {n / 1024:.1f} KiB on the serial console in {a:.2f}-{b:.2f} s, '
+                                       f'{share:.0%} of the line rate over D')
+        w = waits_on(off, irqs) if kind == 'preemptoff' else None
+        if w:
+            return 'KERNEL_WARN', f'waits on C{w[0]} irqsoff {w[3]:.0f} ms ({w[4]})'
+        if any(f <= e + 0.1 and f + d / 1000 >= s0 for s0, e in windows):
+            return 'KERNEL_WARN', 'inside a WARN splat printout'
+        return 'KERNEL_BAD', ''
+    if CONTEXT_LINE.search(line) and not ('Resume caused by' in line and 'watchdog' in line):  # that one: as before
+        return None, ''
+    return 'KERNEL_WARN', ''
+
+
+def wake_info(lines, since=None):
+    """(abort device, wake device) from the kernel's resume/abort lines in log order (wake_lines): abort device = from
+    the first 'Resume caused by [misconfigured ]IRQ <n>[,] <device>' after a 'Wakeup pending' line (the wake interrupt
+    that aborted a suspend); wake device = from the first resume line (what ended the first suspend since the previous
+    snapshot), else from the sysfs last_resume_reason. Only lines after kernel time `since` (the previous snapshot)
+    count. By device name, never the IRQ number: the same PCIe controller is IRQ 127 under the hypervisor and 134 on
+    stock."""
+    lines = [l.strip() for l in (lines.split(' | ') if isinstance(lines, str) else lines)]
+    abort = wake = None
+    pending = False
+    for l in lines:
+        if ktime(l) is None or (since is not None and ktime(l) <= since):
+            continue
+        pending = pending or 'Wakeup pending' in l
+        m = WAKE_IRQ.search(l)
+        if m:
+            wake = wake or m.group(1)
+            if pending:
+                abort, pending = m.group(1), False
+    if wake is None:
+        m = re.search(r'last_resume_reason \d+ (\S+)', ' '.join(lines))
+        wake = m.group(1) if m else None
+    return abort, wake
+
+
+def wake_lines(h):
+    """Resume/abort lines of snapshot h in kernel order: from its kernel_bad section (all new lines), else health.sh's
+    wakeup_reason (newest three, can miss a pair); plus the sysfs last_resume_reason."""
+    kv = (h.get('wakeup_reason') or '').split(' | ')
+    sec = [l for l in h['_sec'].get('kernel_bad', []) if 'Resume caused by' in l or 'Wakeup pending' in l]
+    return sec + [p for p in kv if p.startswith('last_resume_reason')] if sec else kv
+
+
+def attribute(marks, boot, t):
+    """Phase of the latest (boot, kernel time, phase) marker at or before kernel time t in boot `boot`, else None."""
+    best = max(((k, i, ph) for i, (b, k, ph) in enumerate(marks) if b == boot and t is not None and k <= t),
+               default=None)
+    return best[2] if best else None
 
 
 def num(h, k, default=0):
@@ -167,6 +324,13 @@ def num(h, k, default=0):
         return int(float(h.get(k, default) or default))
     except ValueError:
         return default
+
+
+def fnum(h, k):
+    try:
+        return float(h.get(k))
+    except (TypeError, ValueError):
+        return None
 
 
 class Run:
@@ -194,13 +358,23 @@ class Run:
         self.serial_marks = []      # (epoch, file size) at each snapshot
         self.serial_stale = False
         self.nserial = 0
+        self.console, self.console_off = ConsoleHist(), 0  # serial bytes per kernel time (own offset into the capture)
+        self.irq_kept = []          # irqsoff intervals of the last 3 snapshots (a waiter's report can come later)
+        self.marks = []             # (boot_id, kernel time, phase) of every STAB PHASE_START marker
+        self.probe_retry = False
+        self.good_t = time.time()   # time of the last good snapshot
+        self.held, self.held_once = [], set()  # reports whose console bytes had not reached the capture yet
+        self.group_n = collections.Counter()  # (phase, group) -> preempt/IRQ-off reports seen
+        self.kept_lines = []        # kernel lines of the previous snapshot (a WARN splat can span two snapshots)
+        self.degraded = None        # boot id for which HEALTH_DEGRADED was reported
 
     # ------------------------------------------------------------------ records
-    def event(self, kind, msg='', **kw):
-        rec = {'t': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'phase': self.phase, 'kind': kind, 'msg': msg, **kw}
+    def event(self, kind, msg='', phase=None, **kw):
+        """phase: the phase the finding belongs to when it is not the current one (kernel lines, by kernel time)."""
+        rec = {'t': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'phase': phase or self.phase, 'kind': kind, 'msg': msg, **kw}
         self.ev.write(json.dumps(rec, ensure_ascii=False) + '\n'); self.ev.flush()
         sev = 'ERROR' if kind in ERRORS else 'WARN' if kind in WARNINGS else ''
-        line = f"{rec['t']} [{self.phase}] {sev + ' ' if sev else ''}{kind} {msg}"
+        line = f"{rec['t']} [{rec['phase']}] {sev + ' ' if sev else ''}{kind} {msg}"
         self.logf.write(line + '\n'); self.logf.flush()
         print(line, flush=True)
 
@@ -210,13 +384,14 @@ class Run:
 
     # ------------------------------------------------------------------ health
     def snapshot(self, tag=''):
-        h = self.dev.health(f'{self.phase} {self.nsnap + 1} {tag}'.strip())
+        last = self.last or {}
+        h = self.dev.health(f'{self.phase} {self.nsnap + 1} {tag}'.strip(), last.get('dmesg_last'), last.get('boot_id'))
         if self.serial:
             self.serial_marks.append((time.time(), os.path.getsize(self.serial) if os.path.exists(self.serial) else 0))
             self.serial_marks = self.serial_marks[-50:]
         if h is None:
             return self.lost(tag)
-        self.nsnap += 1
+        self.nsnap, self.good_t = self.nsnap + 1, time.time()
         name = re.sub(r'[^A-Za-z0-9_.-]+', '_', f'{self.phase}{"-" + tag if tag else ""}')
         self.save(f'health/{self.nsnap:04d}-{name}.txt', h['_raw'])
         prev, self.last = self.last, h
@@ -228,6 +403,7 @@ class Run:
             self.inventory = set(h['_sec'].get('inventory', []))
             for s in ('kernel_bad', 'crash_buffer', 'events'):
                 self.seen.update(h['_sec'].get(s, []))
+            self.irq_kept = [irq_intervals(h['_sec'].get('kernel_bad', []))]
             return h
         if h['boot_id'] != prev['boot_id'] or tag.startswith('suspend'):
             self.check_inventory(h, tag)
@@ -238,6 +414,10 @@ class Run:
                 self.unexpected_reboot(prev, h)
             for s in ('kernel_bad', 'crash_buffer', 'events'):  # new boot: compare from here on
                 self.seen.update(h['_sec'].get(s, []))
+            if self.held:  # the old boot's reports that waited for their console bytes: graded with what is there
+                self.grade_lines(self.held, prev.get('boot_id'), self.kept_lines, self.console if self.serial else None)
+            lines = h['_sec'].get('kernel_bad', [])
+            self.irq_kept, self.held, self.held_once, self.kept_lines = [irq_intervals(lines)], [], set(), lines
             new_dumps = set(h.get('pstore_dumps', '').split()) - self.known_dumps
             if new_dumps:
                 self.known_dumps |= new_dumps
@@ -245,15 +425,20 @@ class Run:
             if self.el2:
                 self.el2_up()
             return h
-        for s, kind in (('kernel_bad', 'KERNEL_BAD'), ('crash_buffer', 'CRASH'), ('events', 'ANR')):
+        if (not h.get('dmesg_last') or h.get('kernel_src', 'file') != 'file') and self.degraded != h['boot_id']:
+            self.degraded = h['boot_id']
+            self.event('HEALTH_DEGRADED', f"health.sh had no usable copy of the kernel log (kernel_src="
+                       f"{h.get('kernel_src')}, dmesg_last={h.get('dmesg_last')!r}; /data full or unwritable, or no "
+                       'awk): kernel lines are the last 200 per snapshot, older ones can be missed (once per boot)')
+        if num(h, 'kernel_new') > KERNEL_CAP:
+            self.event('KERNEL_LOG_CAPPED', f"{num(h, 'kernel_new')} new kernel lines of interest since the last "
+                       f'snapshot; only the newest {KERNEL_CAP} were read, findings among the older ones are lost')
+        self.grade_kernel(h)
+        for s, kind in (('crash_buffer', 'CRASH'), ('events', 'ANR')):
             for line in h['_sec'].get(s, []):
                 if line not in self.seen:
                     self.seen.add(line)
-                    if s == 'kernel_bad':
-                        k = kernel_kind(line, windows=printout_windows(h['_sec'].get('kernel_bad', [])))
-                        if k:
-                            self.event(k, line[:300])
-                    elif kind != 'ANR' or 'am_anr' in line:
+                    if kind != 'ANR' or 'am_anr' in line:
                         self.event(kind, line[:300])
         for k, kind in (('tombstones', 'TOMBSTONE'), ('anr_files', 'ANR'), ('dropbox_crash', 'CRASH')):
             if num(h, k) > num(prev, k):
@@ -262,14 +447,110 @@ class Run:
         if new_dumps:
             self.known_dumps |= new_dumps
             self.event('KERNEL_BAD', f'new panic/oops record in pstore: {" ".join(sorted(new_dumps))}')
-        if num(h, 'suspend_fail') > num(prev, 'suspend_fail') and h.get('suspend_last_failed_dev', '').startswith('alarmtimer'):
+        adev, _ = wake_info(wake_lines(h), since=fnum(prev, 'dmesg_last'))
+        # last_failed_dev keeps the last device that ever failed in this boot: it is this attempt's only when a device
+        # step counter rose (overnight 2026-10-13, six wake aborts still showed the alarmtimer of an earlier one)
+        rose = any(num(h, f'suspend_failed_{s}') > num(prev, f'suspend_failed_{s}') for s in DEVICE_STEPS)
+        dev = h.get('suspend_last_failed_dev', '') if rose else ''
+        if num(h, 'suspend_fail') > num(prev, 'suspend_fail') and dev.startswith('alarmtimer'):
             # alarmtimer refuses suspend when an alarm is due within 2 s: the kernel's normal behaviour, not a failure
             self.event('SUSPEND_ABORTED', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}: alarm due "
                        f"(last_failed_dev={h.get('suspend_last_failed_dev')})")
+        elif num(h, 'suspend_fail') > num(prev, 'suspend_fail') and not rose and adev:
+            # A wake interrupt that arrives while the CPUs are frozen aborts the suspend (the kernel's normal behaviour;
+            # seen with the Wi-Fi PCIe controller right after network load, on stock too)
+            self.event('SUSPEND_ABORTED', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}: wake interrupt "
+                       f"pending from {adev} ({h.get('wakeup_reason', '')[:200]})")
         elif num(h, 'suspend_fail') > num(prev, 'suspend_fail'):
             self.event('SUSPEND_FAIL', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}, "
                        f"last_failed_dev={h.get('suspend_last_failed_dev')} step={h.get('suspend_last_failed_step')}")
         return h
+
+    def grade_kernel(self, h):
+        """New kernel_bad lines of snapshot h, in two passes: first the irqsoff intervals (this snapshot and the
+        previous two: a waiter's report can arrive a snapshot later), then each new line (kernel_grade), with the
+        console histogram brought up to date first; a long report whose console bytes are not all in the capture yet
+        waits one snapshot. A line goes to the phase whose marker precedes its start. Preempt/IRQ-off reports are
+        grouped per phase by (kind, report, task with digits as N, reason): the first GROUP_FIRST of a group are
+        written one by one, the rest as one event per group and snapshot with their count."""
+        lines = h['_sec'].get('kernel_bad', [])
+        self.irq_kept = (self.irq_kept + [irq_intervals(lines)])[-3:]
+        held, self.held = self.held, []
+        self.grade_lines(held + lines, h.get('boot_id'), self.kept_lines + lines, self.console_update(), hold=True)
+        self.kept_lines = lines
+
+    def grade_lines(self, lines, boot, context, hist, hold=False):
+        """Grades the unseen lines of boot `boot` (grade_kernel); context: the lines for WARN splat windows."""
+        irqs = {i for batch in self.irq_kept for i in batch}
+        windows = printout_windows(context)
+        more = {}  # (phase, group, kind) -> [count, max D, its F]
+        for line in lines:
+            if line in self.seen:
+                continue
+            off = parse_off(line)
+            if (hold and hist is not None and hist.top is not None and off and off[3] >= 100.0
+                    and line not in self.held_once and hist.top < off[4] + off[3] / 1000):
+                self.held.append(line); self.held_once.add(line)
+                continue
+            self.seen.add(line)
+            kind, why = kernel_grade(line, windows=windows, irqs=irqs, hist=hist)
+            if not kind:
+                continue
+            ph = attribute(self.marks, boot, off[4] if off else ktime(line)) or self.phase
+            tail = f' (collected in {self.phase})' if ph != self.phase else ''
+            if not off:
+                self.event(kind, line[:300] + tail, phase=ph)
+                continue
+            cls = 'short' if off[3] < 100.0 else REASON_CLASS.get(why.split(' ')[0], 'none')
+            group = f"{off[0]} {re.sub(r'[0-9]+', 'N', off[2])} {cls}"
+            self.group_n[(ph, group, kind)] += 1
+            if self.group_n[(ph, group, kind)] <= GROUP_FIRST:
+                self.event(kind, line[:300] + (f' [{why}]' if why else '') + tail, phase=ph, group=group)
+                continue
+            m = more.setdefault((ph, group, kind), [0, 0.0, 0.0])
+            m[0] += 1
+            if off[3] > m[1]:
+                m[1], m[2] = off[3], off[4]
+        for (ph, group, kind), (n, d, f) in more.items():
+            self.event(kind, f'{n} more like this: {group}, max {d:.3f} ms at F={f:.6f}s'
+                       + (f' (collected in {self.phase})' if ph != self.phase else ''), phase=ph, group=group, count=n)
+
+    def console_update(self):
+        """The console histogram, fed up to the end of the serial capture; None without a capture (or when it cannot
+        be read: the capture can be replaced while a run reads it)."""
+        if not self.serial:
+            return None
+        try:
+            end = os.path.getsize(self.serial)
+            if end < self.console_off:  # a new capture file
+                self.console, self.console_off = ConsoleHist(), 0
+            with open(self.serial, 'rb') as f:
+                f.seek(self.console_off)
+                while self.console_off < end:
+                    b = f.read(min(8 << 20, end - self.console_off))
+                    if not b:
+                        break
+                    self.console.feed(b); self.console_off += len(b)
+        except OSError:
+            return None
+        return self.console
+
+    def mark_phase(self):
+        """Writes 'STAB PHASE_START <phase>' to the kernel log and reads back its kernel time in the same call: kernel
+        lines are attributed to the phase whose marker is the latest one before them (snapshots collect a step's last
+        lines during the next step)."""
+        m = f'STAB PHASE_START {self.phase}'
+        _, out = self.dev.su(f'echo {shlex.quote(m)} > /dev/kmsg; cat /proc/sys/kernel/random/boot_id; '
+                             f'dmesg | grep -F {shlex.quote(m)} | tail -1', timeout=60)
+        lines = [l.strip() for l in (out or '').splitlines()]
+        boot = next((l for l in lines if re.fullmatch(r'[0-9a-f]{8}-[0-9a-f-]{27}', l)), None)
+        t = next((ktime(l) for l in lines if l.endswith(m) and ktime(l) is not None), None)
+        if boot and t is not None:
+            self.marks.append((boot, t, self.phase))
+        elif self.last:  # not read back (e.g. a loaded device): from the last snapshot on, the collecting phase
+            self.marks.append((self.last.get('boot_id'), fnum(self.last, 'dmesg_last') or 0.0, None))
+            self.event('INFO', f'phase marker not read back ({" ".join((out or "").split())[-80:]}): kernel lines '
+                       'after the last snapshot go to the phase that collects them')
 
     def check_inventory(self, h, tag):
         """After a reboot or a resume every device of the first snapshot must be back (PCI, USB, sound cards, network
@@ -284,9 +565,30 @@ class Run:
             self.event('INFO', f'{tag}: new in the inventory: ' + '; '.join(extra)[:200])
 
     def lost(self, tag):
-        self.event('DEVICE_LOST', f'no adb/health answer ({tag}); waiting up to {self.lost_timeout} s')
+        """No health answer. A probe that timed out (under full load a snapshot can outlast its 180 s) on a device that
+        answers adb within 60 s with the same boot id: PROBE_TIMEOUT and one retry; a retry that fails too is
+        DEVICE_GONE (a live device whose probe keeps failing would otherwise never be checked again). Any other
+        failure: DEVICE_LOST, then wait up to lost_timeout."""
+        why = getattr(self.dev, 'fail', None) or 'no answer'
+        self.event('INFO', f'no health answer ({tag}): {why}; waiting')
         t0 = time.time()
-        if not self.dev.wait_alive(self.lost_timeout):
+        if why == 'timeout' and self.last and self.dev.wait_alive(60):
+            _, out = self.dev.sh('cat /proc/sys/kernel/random/boot_id', timeout=30)
+            if (out or '').strip() == self.last.get('boot_id'):
+                self.event('PROBE_TIMEOUT', f'health probe timed out ({tag}), back after {time.time() - t0:.0f} s, '
+                           'same boot')
+                if self.probe_retry:  # not the time since the last good snapshot: a 1500 s standby is longer
+                    self.serial_extract('probe-fails')
+                    self.event('DEVICE_GONE', 'health probe fails on a live device: the retry timed out too (no good '
+                               f'snapshot for {time.time() - self.good_t:.0f} s)')
+                    raise Abort('health probe fails')
+                self.probe_retry = True
+                try:
+                    return self.snapshot(tag + '-after-timeout')
+                finally:
+                    self.probe_retry = False
+        self.event('DEVICE_LOST', f'no adb/health answer ({tag}); waiting up to {self.lost_timeout} s')
+        if not self.dev.wait_alive(max(0, self.lost_timeout - (time.time() - t0))):
             self.serial_extract('device-gone')
             self.event('DEVICE_GONE', f'not back after {self.lost_timeout} s: hung or powered off; a person must look '
                        '(power button, serial console)')
@@ -299,7 +601,8 @@ class Run:
         self.serial_extract('device-lost')
         h = self.dev.health()
         if h is None:
-            self.event('DEVICE_GONE', 'back on adb but health snapshot fails'); raise Abort('health fails')
+            self.event('DEVICE_GONE', f'back on adb but the health probe fails ({getattr(self.dev, "fail", None)})')
+            raise Abort('health fails')
         return self.snapshot(tag + '-after-lost')
 
     def unexpected_reboot(self, prev, h):
@@ -452,6 +755,7 @@ class Run:
             raise Abort('identity mismatch')
         if self.serial:
             self.serial_scan_off = os.path.getsize(self.serial) if os.path.exists(self.serial) else 0
+            self.console_off = max(0, self.serial_scan_off - (1 << 20))  # console bytes from a little before the start
             self.event('INFO', f'serial capture {self.serial} from byte {self.serial_scan_off}')
         self.snapshot('baseline')
         if self.el2:
@@ -745,6 +1049,7 @@ class Run:
         for step in p.get('steps', ['ipi', 'timer', 'idle', 'traffic', 'affinity', 'hotplug', 'pmu', 'all']):
             self.phase = f'{base}/{step}'
             self.event('PHASE_START', f'{step} {secs} s')
+            self.mark_phase()
             t0 = time.time()
             soff = os.path.getsize(self.serial) if self.serial and os.path.exists(self.serial) else 0
             if step == 'pmu' and self.el2:  # the monitor owns the PMU while it counts
@@ -802,6 +1107,7 @@ class Run:
                                ' '.join(f'{c}:{m_:.0%}/{x:.0%}' for c, (m_, x, _) in w.items()))
             self.event('PHASE_END', step)
         self.phase = base
+        self.mark_phase()  # back in the outer phase: later kernel lines are not the last step's
 
     def phase_monitor_soak(self, p):
         script = os.path.expanduser(p.get('skill', '~/.codex/skills/xhyper-el2-monitor-android/scripts/el2-monitor.sh'))
@@ -834,6 +1140,7 @@ class Run:
             for i, p in enumerate(self.plan['phases'], 1):
                 self.phase = f"{i}-{p['type']}"
                 self.event('PHASE_START', json.dumps(p, ensure_ascii=False))
+                self.mark_phase()
                 getattr(self, 'phase_' + p['type'])(p)
                 self.dismiss_anr_dialogs('phase-end')
                 self.snapshot('phase-end')
@@ -863,6 +1170,11 @@ class Run:
             write_summary(self.out)
 
 
+def count(evs):
+    """Findings in these events: an aggregated event carries `count`."""
+    return sum(e.get('count', 1) for e in evs)
+
+
 def write_summary(out):
     evs = [json.loads(l) for l in open(os.path.join(out, 'events.jsonl')) if l.strip()]
     errors = [e for e in evs if e['kind'] in ERRORS]
@@ -873,13 +1185,20 @@ def write_summary(out):
     verdict = 'FAIL' if errors or any(e['kind'] == 'ABORT' for e in evs) else 'PASS'
     L = [f'# Stability run {os.path.basename(out)}: {verdict}', '', f'- identity: `{ident}`',
          *(['- EL2 parallel log: el2-summary.md, el2-per-second.csv'] if os.path.exists(os.path.join(out, 'el2-summary.md')) else []),
-         f'- events: {len(evs)}; errors {len(errors)}; warnings {len(warns)}', '',
-         '| kind | count |', '|---|---|']
-    for k, n in sorted(collections.Counter(e['kind'] for e in evs).items()):
+         f'- events: {count(evs)}; errors {count(errors)}; warnings {count(warns)} (an event with a count stands for '
+         'that many findings of one kind)', '', '| kind | count |', '|---|---|']
+    kinds = collections.Counter()
+    for e in evs:
+        kinds[e['kind']] += e.get('count', 1)
+    for k, n in sorted(kinds.items()):
         L.append(f'| {k} | {n} |')
     L += ['', '## Phases', ''] + [f"- {e['t']} {e['phase']} {e['kind']} {e['msg'][:160]}" for e in phases]
-    L += ['', '## Errors', ''] + [f"- {e['t']} {e['phase']} {e['kind']}: {e['msg']}" for e in errors] + \
-         ['', '## Warnings', ''] + [f"- {e['t']} {e['phase']} {e['kind']}: {e['msg'][:200]}" for e in warns[:200]]
+    L += ['', '## Errors', ''] + [f"- {e['t']} {e['phase']} {e['kind']}: {e['msg']}" for e in errors]
+    L += ['', '## Warnings (first 20 events of each kind)', '']
+    for k in sorted({e['kind'] for e in warns}):
+        ws = [e for e in warns if e['kind'] == k]
+        L += [f'### {k} ({count(ws)})', ''] + [f"- {e['t']} {e['phase']}: {e['msg'][:200]}" for e in ws[:20]]
+        L += ([f'- ... {len(ws) - 20} more events'] if len(ws) > 20 else []) + ['']
     open(os.path.join(out, 'summary.md'), 'w').write('\n'.join(L) + '\n')
     print(f'summary: {os.path.join(out, "summary.md")} -> {verdict}')
 
