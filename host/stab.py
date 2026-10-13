@@ -502,7 +502,39 @@ class Run:
                     '--ignore-crashes --ignore-timeouts --ignore-security-exceptions --monitor-native-crashes '
                     f'-v {count} > {DEV}/monkey.log 2>&1 &', timeout=30)
 
+    def music_state(self, pkg):
+        _, out = self.dev.sh('dumpsys media_session', timeout=30)
+        m = re.search(r'package=' + re.escape(pkg) + r'.*?state=PlaybackState \{state=([A-Z_]+)|package='
+                      + re.escape(pkg) + r'[\s\S]{0,800}?state=([A-Z_]+)\(', out)
+        return (m.group(1) or m.group(2)) if m else 'NONE'
+
+    def music_play(self, mu):
+        """Plays mu['path'] in the music app's track page through a VIEW intent on its MediaStore entry (the way
+        workspace tools/perf/t11206-music.sh drives the Kylin music app). Volume set with key events (the media_session
+        volume command does not move the speaker index on T11206)."""
+        pkg = mu.get('package', 'com.kylinos.music')
+        _, q = self.dev.sh('content query --uri content://media/external/audio/media --projection _id:_data', timeout=30)
+        m = re.search(r'_id=(\d+), _data=\S*/' + re.escape(os.path.basename(mu.get('path', '/sdcard/Music/test.mp3')))
+                      + r'\b', q)
+        if not m:
+            if not getattr(self, '_music_skip', False):
+                self._music_skip = True
+                self.event('SKIP', f"music: {mu.get('path', '/sdcard/Music/test.mp3')} not in the device's media library")
+            return False
+        keys = ' '.join(['KEYCODE_VOLUME_DOWN'] * 15 + ['KEYCODE_VOLUME_UP'] * int(mu.get('volume', 3)))
+        self.dev.sh(f'input keyevent {keys}', timeout=60)
+        self.dev.sh(f'am start -a android.intent.action.VIEW -d content://media/external/audio/media/{m.group(1)} '
+                    f'-t audio/mpeg -n {pkg}/{mu.get("activity", ".activities.TrackActivity")}', timeout=30)
+        time.sleep(5)
+        st = self.music_state(pkg)
+        self.event('INFO', f'music: track {m.group(1)} started, session state {st}')
+        return True
+
     def phase_soak(self, p):
+        mu = p.get('music')
+        if mu:
+            self.music_play(mu)
+            next_music = time.time() + mu.get('check_every_s', 300)
         if p.get('monkey', True):
             self.monkey(True, p)
         end = time.time() + p['minutes'] * 60
@@ -515,6 +547,10 @@ class Run:
                     n += 1
                     self.stress_burst(p.get('stress_seconds', 120), p['stress_args'], f'soak{n:03d}')
                     next_stress = time.time() + p.get('stress_every_min', 10) * 60
+                if mu and time.time() >= next_music:
+                    if self.music_state(mu.get('package', 'com.kylinos.music')) != 'PLAYING':
+                        self.music_play(mu)
+                    next_music = time.time() + mu.get('check_every_s', 300)
                 if time.time() >= next_screen:
                     self.screen(False); self.wait(p.get('screen_off_s', 90), 'screen-off'); self.screen(True)
                     next_screen = time.time() + p.get('screen_cycle_min', 15) * 60
@@ -522,6 +558,8 @@ class Run:
         finally:
             if p.get('monkey', True):
                 self.monkey(False)
+            if mu:  # do not carry playback into the suspend phases (a forced suspend that cuts playback pops)
+                self.dev.sh('cmd media_session dispatch pause', timeout=30)
             self.screen(True)
 
     def suspend_once(self, sleep_s, i):

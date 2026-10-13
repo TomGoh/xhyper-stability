@@ -30,7 +30,7 @@ python3 host/stab.py report <输出目录>      # 重新生成 summary.md
 | 类型 | 做什么 | 主要压到虚拟化层的哪部分 |
 |---|---|---|
 | `reboot_loop` | 反复冷启动，核对开机原因、开机号、pstore | 启动路径、各核上线 |
-| `soak` | 限定应用的 monkey 随机操作；每隔一段时间跑一次 stress-ng 定向压力；定期灭屏亮屏 | 核间中断（`--affinity --switch --futex --membarrier --tlb-shootdown`）、定时器（`--timer --hrtimers --cyclic`）、内存（`--vm`）、各类设备中断 |
+| `soak` | 限定应用的 monkey 随机操作；每隔一段时间跑一次 stress-ng 定向压力；定期灭屏亮屏；可选放音乐（`music`：用 VIEW 意图在音乐应用的曲目页打开媒体库里的指定文件，按键设音量，定时检查、停了就重放，阶段结束前暂停） | 核间中断（`--affinity --switch --futex --membarrier --tlb-shootdown`）、定时器（`--timer --hrtimers --cyclic`）、内存（`--vm`）、各类设备中断 |
 | `suspend` | 用 `rtcwake -m mem` 强制系统睡眠，由闹钟唤醒，核对睡眠成功和失败计数 | 系统睡眠、各核掉电和上电、唤醒中断 |
 | `memtest` | stressapptest 在高负载下检查内存内容 | 第二阶段映射、缓存维护；出错时报数据不一致 |
 | `latency` | cyclictest 测空闲和有负载时的唤醒延迟 | 定时器注入、唤醒路径 |
