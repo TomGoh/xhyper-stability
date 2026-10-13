@@ -77,7 +77,8 @@ class Device:
         return False
 
     def health(self, marker=''):
-        rc, out = self.su(f'sh {DEV}/health.sh {shlex.quote(marker)}' if marker else f'sh {DEV}/health.sh', timeout=90)
+        # 180 s: under the all-at-once EL2 stress a snapshot (dumpsys, logcat) took over 90 s on T11206 (2026-10-13)
+        rc, out = self.su(f'sh {DEV}/health.sh {shlex.quote(marker)}' if marker else f'sh {DEV}/health.sh', timeout=180)
         if rc != 0 or 'boot_id=' not in out:
             return None
         h, sec, name = {'_raw': out}, collections.defaultdict(list), None
