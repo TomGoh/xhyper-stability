@@ -640,6 +640,8 @@ def main():
     r.add_argument('--plan', required=True)
     r.add_argument('--out', required=True)
     r.add_argument('--expect-boot-sha', default='')
+    r.add_argument('--no-el2', action='store_true',
+                   help='ignore the plan\'s el2_monitor (an image without the hypervisor, e.g. the stock baseline)')
     rp = sub.add_parser('report')
     rp.add_argument('dir')
     a = ap.parse_args()
@@ -648,6 +650,8 @@ def main():
     if not a.serial:
         sys.exit('no serial: -s or ANDROID_SERIAL')
     plan = json.load(open(a.plan))
+    if a.no_el2:
+        plan.pop('el2_monitor', None)
     os.makedirs(a.out, exist_ok=True)
     dev = Device(a.serial)
     run = Run(dev, a.out, plan)
