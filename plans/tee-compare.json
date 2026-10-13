@@ -1,0 +1,6 @@
+{
+  "name": "tee compare: the TEE step (2 workers, cyclictest alongside) for 120 s, no EL2 monitor (its sampling IPIs would disturb the latency it measures); run the same on stock",
+  "health_interval_s": 60,
+  "lost_timeout_s": 600,
+  "phases": [{"type": "el2_stress", "seconds": 120, "steps": ["tee"]}]
+}

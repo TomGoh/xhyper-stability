@@ -1,0 +1,8 @@
+{
+  "name": "tee smoke: the TEE step (keystore generate / sign-verify / delete) for 90 s, then the scaled all-at-once step for 180 s",
+  "health_interval_s": 60,
+  "lost_timeout_s": 600,
+  "el2_monitor": {"artifacts": "${XHYPER_MONITOR_ARTIFACTS}", "interval_s": 1},
+  "phases": [{"type": "el2_stress", "seconds": 90, "steps": ["tee"]},
+             {"type": "el2_stress", "seconds": 180, "steps": ["all"]}]
+}

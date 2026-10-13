@@ -72,6 +72,7 @@
         "radio",
         "copy",
         "gpu",
+        "tee",
         "pmu",
         "all",
         "ipi",
@@ -83,6 +84,7 @@
         "radio",
         "copy",
         "gpu",
+        "tee",
         "pmu",
         "all"
       ],

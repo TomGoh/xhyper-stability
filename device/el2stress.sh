@@ -21,7 +21,13 @@
 #             DMA; catches silent corruption a crash check misses; borrowed from kylin100-autotest)
 #   gpu       GPU load: glmark2 rendering forever (the harness installs it from STAB_APK_DIR); GPU job interrupts, GPU
 #             memory mapping, display vsync; reports the GPU interrupt rate and the GPU frequency reached
-#   all       ipi + timer + idle + affinity (with traffic) + hotplug + copy + gpu at once
+#   tee       TEE calls: parallel workers generate an RSA key in the TEE (KeyMint in Trusty), sign and verify with it
+#             five times, delete it, again; each call is an SMC the hypervisor forwards and a Trusty notification on
+#             SGI 13 (which XHyper hooks); every verify must say OK; keys are named stab_tee_* and all removed at the end
+#             (TEE encrypt/decrypt with keystore_cli_v2 failed on decrypt on 2026-10-13: not used until compared on stock)
+#   all       ipi + timer + idle + affinity (with traffic) + hotplug + copy + gpu at once (not tee: TEE key generation
+#             holds a CPU in the secure world for about 0.9 s per call, which together with everything else starved
+#             system_server's watchdog for 16 s on 2026-10-13)
 # Output: one line per finished part, "EL2STRESS <step> <part> rc=<n>"; the last line "EL2STRESS_DONE <step>".
 S=${1:?step}; T=${2:?seconds}; GW=${3:-}
 D=/data/local/tmp/stab; N=$D/stress-ng; TMP=$D/tmp
@@ -145,7 +151,35 @@ gpu() {
   am force-stop org.linaro.glmark2
   echo "EL2STRESS $S glmark2 gpu_irq=$irq irq_per_s=$(( (b - a) / (t1 - t0 + 1) )) max_freq=$fmax rc=0"
 }
+tee() {
+  command -v keystore_cli_v2 > /dev/null || { echo "EL2STRESS $S keystore_cli_v2 missing rc=3"; return; }
+  trusty() { awk '$NF == "trusty" { s = 0; for (i = 2; i <= 9; i++) s += $i; print s }' /proc/interrupts; }
+  # cyclictest alongside: how long CPUs stay out of Linux's reach while a TEE call runs (an interrupt that arrives
+  # while the CPU is in the secure world should make Trusty yield quickly; a TEE call that cannot be interrupted shows
+  # up here as a latency of up to the length of the call, about 0.9 s for an RSA key generation on T11206)
+  [ -x $D/cyclictest ] && $D/cyclictest -m -p 90 -i 1000 -t -a -q -D ${T}s > $TMP/tee-cyclic.log 2>&1 &
+  a=$(trusty); end=$(( $(date +%s) + T )); W=${TEE_WORKERS:-2}
+  w=0; while [ $w -lt $W ]; do
+    ( n=0; ops=0; bad=0
+      while [ $(date +%s) -lt $end ]; do
+        k=stab_tee_w${w}_$n; n=$((n + 1))
+        keystore_cli_v2 generate --name=$k > /dev/null 2>&1 || bad=$((bad + 1)); ops=$((ops + 1))
+        for i in 1 2 3 4 5; do
+          keystore_cli_v2 sign-verify --name=$k 2>&1 | grep -q "Verify: OK" || bad=$((bad + 1)); ops=$((ops + 1))
+        done
+        keystore_cli_v2 delete --name=$k > /dev/null 2>&1; ops=$((ops + 1))
+      done
+      echo "$ops $bad" > $TMP/tee-w$w ) &
+    w=$((w + 1))
+  done
+  wait
+  ops=0; bad=0; for f in $TMP/tee-w*; do set -- $(cat $f); ops=$((ops + $1)); bad=$((bad + $2)); done; rm -f $TMP/tee-w*
+  for k in $(keystore_cli_v2 list --prefix=stab_tee 2>/dev/null | grep stab_tee); do keystore_cli_v2 delete --name=$k > /dev/null 2>&1; done
+  b=$(trusty); wait
+  cmax=$(grep -oE 'Max: *[0-9]+' $TMP/tee-cyclic.log 2>/dev/null | awk '{printf "%s%s", sep, $2; sep=","}')
+  echo "EL2STRESS $S tee workers=$W ops=$ops failures=$bad trusty_irq=$((b - a)) cyclictest_max_us=[$cmax] rc=$([ $bad = 0 ] && echo 0 || echo 1)"
+}
 all() { export LIGHT=1; ipi & timer & idle & affinity & hotplug & copy & gpu & wait; }
 
-case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|radio|copy|gpu|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
+case $S in ipi|timer|idle|traffic|affinity|hotplug|pmu|radio|copy|gpu|tee|all) $S ;; *) echo "unknown step $S"; exit 2 ;; esac
 echo "EL2STRESS_DONE $S"

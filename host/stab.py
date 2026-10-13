@@ -21,7 +21,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
 ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
+WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
 
 
@@ -220,6 +220,9 @@ class Run:
         name = re.sub(r'[^A-Za-z0-9_.-]+', '_', f'{self.phase}{"-" + tag if tag else ""}')
         self.save(f'health/{self.nsnap:04d}-{name}.txt', h['_raw'])
         prev, self.last = self.last, h
+        if (prev is None or h.get('boot_id') != prev.get('boot_id')) and (h.get('pc_mode') == '1' or h.get('desk_visible') == '1'):
+            self.event('PC_MODE', f"device is in desktop (PC) mode (kylin_rotation_state_saved_before_pc_mode="
+                       f"{h.get('pc_mode')}, Desk visible={h.get('desk_visible')}): the plans expect tablet mode")
         if prev is None:  # baseline: what is already there is not a finding
             self.known_dumps = set(h.get('pstore_dumps', '').split())
             self.inventory = set(h['_sec'].get('inventory', []))

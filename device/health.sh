@@ -16,6 +16,10 @@ kv bootloader_reason "$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^androidboot.boo
 for f in success fail failed_freeze failed_suspend failed_resume last_failed_dev last_failed_step; do
   kv "suspend_$f" "$(cat /sys/power/suspend_stats/$f 2>/dev/null)"
 done
+# Tablet vs desktop (PC) mode on the Kylin tablets: the rotation state saved on entering PC mode is 1 while in PC mode
+# (seen 1 in PC mode and 0 after switching back, 2026-10-13), and the freeform "Desk" task is visible in PC mode.
+kv pc_mode "$(settings get system kylin_rotation_state_saved_before_pc_mode 2>/dev/null)"
+kv desk_visible "$(dumpsys window 2>/dev/null | grep -m1 'name=Desk ' | grep -c 'visible=true')"
 kv wakefulness "$(dumpsys power 2>/dev/null | sed -n 's/.*mWakefulness=\([A-Za-z]*\).*/\1/p' | head -1)"
 kv loadavg "$(cut -d' ' -f1-3 /proc/loadavg)"
 kv mem_avail_kb "$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)"
