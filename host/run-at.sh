@@ -9,6 +9,8 @@ set -u
 AT=${1:?HH:MM}; OUT=${2:?out dir}; shift 2; [ "${1:-}" = -- ] && shift
 cd "$(dirname "$0")/.." || exit 1
 echo $$ > "$OUT.pid"
+# macOS: keep the host awake (no idle sleep) for as long as this script runs, or the run stops with it.
+command -v caffeinate >/dev/null && caffeinate -i -s -w $$ &
 now=$(date +%s); target=$(date -j -f '%Y-%m-%d %H:%M' "$(date +%Y-%m-%d) $AT" +%s 2>/dev/null || date -d "today $AT" +%s)
 [ "$target" -le "$now" ] && target=$((target + 86400))
 echo "$(date '+%F %T') waiting until $(date -r "$target" '+%F %T' 2>/dev/null || date -d "@$target" '+%F %T')" > "$OUT.console"
