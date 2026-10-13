@@ -1,0 +1,6 @@
+# name  git-url  tag  full-commit-sha   (2026-10-13)
+stress-ng https://github.com/ColinIanKing/stress-ng V0.22.01 72a9d0cae0f420a887991d4024d3101c4af7a4fc
+stressapptest https://github.com/stressapptest/stressapptest v1.0.11 25e31a2c1fcc66f3a43e91998f0819b016322a70
+rt-tests https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git v2.11 62da2befac98f811af8e56f2b7992fb09faa33d6
+numactl https://github.com/numactl/numactl v2.0.19 3bc85e37d5a30da6790cb7e8bb488bb8f679170f
+fastbot https://github.com/bytedance/Fastbot_Android main d057b99115caf0c315d2b3bd6950326f3a51045c
