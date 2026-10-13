@@ -1,0 +1,9 @@
+{
+  "name": "el2 stress smoke: every EL2 stress step once for 60 s (about 15 minutes), to check the steps and that each one loads EL2",
+  "health_interval_s": 60,
+  "lost_timeout_s": 600,
+  "el2_monitor": {"artifacts": "${XHYPER_MONITOR_ARTIFACTS}", "interval_s": 1},
+  "phases": [
+    {"type": "el2_stress", "seconds": 60, "steps": ["ipi", "timer", "idle", "traffic", "affinity", "hotplug", "pmu", "all"]}
+  ]
+}

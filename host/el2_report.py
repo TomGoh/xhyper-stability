@@ -93,6 +93,21 @@ class Scanner:
         return out
 
 
+def window(run_dir, t0, t1):
+    """{cpu: (mean share, max share, samples)} over samples whose epoch lies in [t0, t1]."""
+    pmap, acc = policy_map(run_dir), collections.defaultdict(list)
+    for path in sorted(glob.glob(os.path.join(run_dir, 'el2', '*.log'))):
+        last = {}
+        for _, bt, ep, fr, cpus in blocks(path):
+            for c, (cy, ts) in cpus.items():
+                if t0 <= ep <= t1 and c in last and ts > last[c][1] and cy >= last[c][0] and fr:
+                    f = fr[min(pmap.get(c, 0), len(fr) - 1)] * 1000
+                    if f:
+                        acc[c].append((cy - last[c][0]) / ((ts - last[c][1]) / 1e9 * f))
+                last[c] = (cy, ts)
+    return {c: (sum(v) / len(v), max(v), len(v)) for c, v in sorted(acc.items()) if v}
+
+
 def phases(run_dir):
     """[(start_epoch, end_epoch, name)] from events.jsonl."""
     evs = [json.loads(l) for l in open(os.path.join(run_dir, 'events.jsonl')) if l.strip()]

@@ -21,7 +21,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
 ERRORS = {'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
+WARNINGS = {'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'DEVICE_LOST', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
             'MONKEY_ANR', 'BOOT_REASON'}
 
 
@@ -216,7 +216,8 @@ class Run:
         if h is None:
             return self.lost(tag)
         self.nsnap += 1
-        self.save(f'health/{self.nsnap:04d}-{self.phase}{"-" + tag if tag else ""}.txt', h['_raw'])
+        name = re.sub(r'[^A-Za-z0-9_.-]+', '_', f'{self.phase}{"-" + tag if tag else ""}')
+        self.save(f'health/{self.nsnap:04d}-{name}.txt', h['_raw'])
         prev, self.last = self.last, h
         if prev is None:  # baseline: what is already there is not a finding
             self.known_dumps = set(h.get('pstore_dumps', '').split())
@@ -332,6 +333,8 @@ class Run:
             f.seek(self.serial_scan_off)
             chunk = f.read(end - self.serial_scan_off)
         self.serial_scan_off = end
+        for l in [l for l in chunk.splitlines() if b'XHYPER_VCPU_WAKEUP_LOST' in l][:5]:
+            self.event('HV_WAKEUP_AUDIT', l.decode('utf-8', 'replace')[:240])
         hits = [l for l in chunk.splitlines() if SERIAL_FATAL.search(l)]
         for l in hits[:10]:
             self.event('SERIAL_FATAL', l.decode('utf-8', 'replace')[:300])
@@ -354,7 +357,9 @@ class Run:
                        '(set XHYPER_MONITOR_ARTIFACTS)'); self.el2 = None; return
         self.el2_order = ko_load_order(art)
         kos = [os.path.join(art, f'{m}.ko') for m in self.el2_order]
-        self.dev.su(f'mkdir -p {DEV}/xhmon {DEV}/el2 && chmod 777 {DEV}/xhmon {DEV}/el2')
+        # Logs of earlier runs were pulled by those runs; a stale log would be scanned again as this run's data.
+        self.dev.su(f'kill $(cat {DEV}/el2/el2log.pid 2>/dev/null) 2>/dev/null; rm -f {DEV}/el2/*.log {DEV}/el2/el2log.pid; '
+                    f'mkdir -p {DEV}/xhmon {DEV}/el2 && chmod 777 {DEV}/xhmon {DEV}/el2')
         rc, out = self.dev.adb('push', *kos, os.path.join(REPO, 'device', 'el2log.sh'), f'{DEV}/xhmon/', timeout=300)
         if rc != 0:
             self.event('EL2_LOG_DOWN', 'push of monitor modules failed: ' + out[-200:]); self.el2 = None; return
@@ -373,8 +378,10 @@ class Run:
         cmd = (f'if [ ! -e /proc/xcore_stats ]; then for m in {mods}; do grep -q "^$m " /proc/modules || '
                f'insmod {DEV}/xhmon/$m.ko || echo "INSMOD_FAIL $m"; done; fi; '
                '[ -e /proc/xcore_stats ] || { echo NO_STATS; exit 1; }; '
-               'n=$(tail -n +2 /proc/xcore_stats | awk "\\$2 > 0" | wc -l); '
-               '[ "$n" -gt 0 ] || echo 1 > /proc/xcore_stats; '
+               # Counting means the counts move: a stopped monitor keeps its committed (non-zero) counts.
+               'a=$(tail -n +2 /proc/xcore_stats | awk "{s += \\$2} END {print s}"); sleep 0.5; '
+               'b=$(tail -n +2 /proc/xcore_stats | awk "{s += \\$2} END {print s}"); '
+               '[ "$b" != "$a" ] || { echo 1 > /proc/xcore_stats; echo STARTED_MONITOR; }; '
                f'pid=$(cat {DEV}/el2/el2log.pid 2>/dev/null); '
                'if [ -z "$pid" ] || ! tr "\\0" " " < /proc/$pid/cmdline 2>/dev/null | grep -q el2log; then '
                f'nohup sh {DEV}/xhmon/el2log.sh {DEV}/el2 {iv} > /dev/null 2>&1 & echo STARTED; fi; echo EL2_UP')
@@ -382,7 +389,8 @@ class Run:
         if 'EL2_UP' not in out:
             self.event('EL2_LOG_DOWN', 'monitor/log not up: ' + ' '.join(out.split())[-200:])
             return False
-        self.event('INFO', 'EL2 log up' + (' (loop started)' if 'STARTED' in out else ''))
+        self.event('INFO', 'EL2 log up' + (' (monitor started)' if 'STARTED_MONITOR' in out else '')
+                   + (' (loop started)' if '\nSTARTED' in out or out.startswith('STARTED') else ''))
         return True
 
     def el2_pull_scan(self):
@@ -407,7 +415,7 @@ class Run:
         if not self.dev.alive():
             raise Abort(f'device {self.dev.serial} not reachable')
         self.dev.su(f'mkdir -p {DEV}/tmp && chmod 777 {DEV} {DEV}/tmp')
-        files = [os.path.join(REPO, 'device', 'health.sh')]
+        files = [os.path.join(REPO, 'device', 'health.sh'), os.path.join(REPO, 'device', 'el2stress.sh')]
         tdir = os.path.join(REPO, 'third_party', 'out', 'aarch64')
         for t in ('stress-ng', 'stressapptest', 'cyclictest', 'hackbench'):
             if os.path.exists(os.path.join(tdir, t)):
@@ -663,6 +671,71 @@ class Run:
             mx = [int(x) for x in re.findall(r'Max:\s+(\d+)', out)]
             self.event('INFO', f'cyclictest {load}: max latency per thread {mx} us')
 
+    def phase_el2_stress(self, p):
+        """Steps of device/el2stress.sh, one exit class each, measured: EL2 share per CPU from the EL2 parallel log and
+        the hypervisor's hot-path counters (XHYPER_*_INPLACE, SGI, idle-wake lines) from the serial console."""
+        _, rt = self.dev.sh('ip route show table all', timeout=30)
+        m = re.search(r'default via (\S+) dev wlan0', rt)
+        gw = m.group(1) if m else ''
+        base, secs = self.phase, int(p.get('seconds', 180))
+        for step in p.get('steps', ['ipi', 'timer', 'idle', 'traffic', 'affinity', 'hotplug', 'pmu', 'all']):
+            self.phase = f'{base}/{step}'
+            self.event('PHASE_START', f'{step} {secs} s')
+            t0 = time.time()
+            soff = os.path.getsize(self.serial) if self.serial and os.path.exists(self.serial) else 0
+            if step == 'pmu' and self.el2:  # the monitor owns the PMU while it counts
+                self.dev.su('echo 0 > /proc/xcore_stats', timeout=30)
+            usb = None
+            if step in ('traffic', 'affinity', 'all'):  # USB bulk traffic: device-side USB controller interrupts
+                usb = subprocess.Popen(['adb', '-s', self.dev.serial, 'exec-out',
+                                        f'timeout {secs} cat /dev/zero'], stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            self.dev.su(f'nohup sh {DEV}/el2stress.sh {step} {secs} {gw} > {DEV}/tmp/el2stress-{step}.log 2>&1 &',
+                        timeout=30)
+            self.wait(secs, step)
+            out, end = '', time.time() + 300
+            while time.time() < end:
+                _, out = self.dev.su(f'cat {DEV}/tmp/el2stress-{step}.log', timeout=30)
+                if f'EL2STRESS_DONE {step}' in out:
+                    break
+                self.checkpoint(step)
+                time.sleep(10)
+            if usb:
+                usb.kill()
+            self.save(f'el2stress-{step}.txt', out)
+            if f'EL2STRESS_DONE {step}' not in out:
+                self.event('STRESS_FAIL', f'{step}: no EL2STRESS_DONE within {secs + 300} s')
+                self.snapshot(f'{step}-late')
+            for l in out.splitlines():
+                if l.startswith('EL2STRESS ') and ' rc=' in l and not re.search(r' rc=0\b', l):
+                    self.event('STRESS_FAIL', f'{step}: {l[:200]}')
+            parts = ' | '.join(l[10 + len(step):].strip() for l in out.splitlines()
+                               if l.startswith(f'EL2STRESS {step} '))
+            self.event('INFO', f'{step}: {parts[:400]}')
+            if step == 'pmu' and self.el2:
+                self.el2_up()
+            if self.serial and os.path.exists(self.serial):
+                with open(self.serial, 'rb') as f:
+                    f.seek(soff)
+                    hv = [l for l in f.read().splitlines() if b'XHYPER_' in l]
+                with open(os.path.join(self.out, f'el2stress-{step}-serial.txt'), 'wb') as o:
+                    o.write(b'\n'.join(hv) + b'\n')
+                last = {}
+                for l in hv:
+                    mm = re.search(rb'(XHYPER_[A-Z0-9_]+)', l)
+                    if mm:
+                        last[mm.group(1).decode()] = l.decode('utf-8', 'replace')
+                keep = [v for k, v in last.items() if k.endswith(('_INPLACE', '_COUNTS', 'IDLE_WAKE', 'REFUSED'))]
+                self.event('INFO', f'{step}: hypervisor counters at end: ' + ' || '.join(x[13:200] for x in keep)[:900])
+            if self.el2:
+                self.el2_pull_scan()
+                w = el2_report.window(self.out, t0 + 5, time.time())
+                if w:
+                    self.event('EL2_LOAD', f'{step}: EL2 share mean/max per CPU ' +
+                               ' '.join(f'{c}:{m_:.0%}/{x:.0%}' for c, (m_, x, _) in w.items()))
+            self.event('PHASE_END', step)
+        self.phase = base
+
     def phase_monitor_soak(self, p):
         script = os.path.expanduser(p.get('skill', '~/.codex/skills/xhyper-el2-monitor-android/scripts/el2-monitor.sh'))
         r = subprocess.run(['bash', script, 'enable', '-s', self.dev.serial, '--out', os.path.join(self.out, 'monitor'),
@@ -701,6 +774,10 @@ class Run:
             self.event('ABORT', str(e))
         except KeyboardInterrupt:
             self.event('ABORT', 'interrupted')
+        except Exception as e:  # a harness bug must never end as PASS
+            import traceback
+            self.save('harness-error.txt', traceback.format_exc())
+            self.event('ABORT', f'harness error {e!r} (traceback in harness-error.txt)')
         finally:
             self.dev.sh('pkill -f com.android.commands.monkey', timeout=20)
             try:
