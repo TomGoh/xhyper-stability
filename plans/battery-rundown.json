@@ -1,0 +1,21 @@
+{
+  "name": "battery rundown: VLC plays Big Buck Bunny 1080p 60 fps on repeat from 100 % to the automatic shutdown (90 Hz, backlight 128 of 255, airplane mode, volume 3 of 15); the operator unplugs USB when told, and after the shutdown plugs it back in and powers the device on; no EL2 monitor (it costs power); stock and the hypervisor image on the same device, two runs each",
+  "health_interval_s": 300,
+  "lost_timeout_s": 900,
+  "phases": [
+    {
+      "type": "battery_rundown",
+      "apk": "vlc",
+      "media": "bbb60",
+      "brightness": 128,
+      "refresh_hz": 90,
+      "volume": 3,
+      "airplane": true,
+      "sample_s": 60,
+      "charge_timeout_h": 4,
+      "unplug_timeout_min": 30,
+      "return_timeout_h": 24,
+      "note": "apk: key in third_party/apks.lock (STAB_APK_DIR), media: key in third_party/media.lock (STAB_MEDIA_DIR); the player needs its one-time preparation per install (README)"
+    }
+  ]
+}

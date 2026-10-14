@@ -1,0 +1,5 @@
+# Media files the harness can play. Not in this repository (size): host/stab.py takes them from the directory in
+# STAB_MEDIA_DIR, checks the size and sha256, and pushes them to /sdcard/Movies/ only when the device copy's sha256
+# differs (a device copy with the right hash is used as it is, also when STAB_MEDIA_DIR is not set).
+# key  file  size  sha256  licence, source
+bbb60  bbb_sunflower_1080p_60fps_normal.mp4  355856562  3aa2d8946ec7cf3b50b7148fb3338ca421e6ec34987b20a4044845d674794e3e  Big Buck Bunny, CC BY 3.0 (c) Blender Foundation; unzipped from https://download.blender.org/demo/movies/BBB/bbb_sunflower_1080p_60fps_normal.mp4.zip

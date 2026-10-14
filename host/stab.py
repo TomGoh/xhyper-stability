@@ -4,27 +4,29 @@
   stab.py run    -s SERIAL --plan plans/<plan>.json --out DIR [--expect-boot-sha PREFIX]
   stab.py report DIR
 
-A run executes the plan's phases in order (reboot_loop, soak, suspend, memtest, standby, monitor_soak) and takes a
-health snapshot (device/health.sh) at least every `health_interval_s`. Failures are classified from the host side,
-because a hypervisor fault rarely leaves a trace inside Android: the device dropping off adb (DEVICE_LOST / DEVICE_GONE),
-a boot id that changed without a planned reboot (UNEXPECTED_REBOOT, with the boot reasons and the pstore files of the
-previous boot pulled), a boot that never completes (BOOT_FAIL); then Android-side findings (new kernel oops/lockup/
-watchdog lines, crash-buffer entries, ANRs, tombstones), stress-tool failures and suspend failures. Kernel lines are
-attributed by their kernel time to the phase they happened in (a `STAB PHASE_START` marker in the kernel log at every
-phase start), not to the snapshot that collected them. Every event goes to events.jsonl and log.txt; summary.md is
-(re)written at the end, also after Ctrl-C or an abort. Python 3 stdlib only.
+A run executes the plan's phases in order (reboot_loop, soak, suspend, memtest, latency, standby, el2_stress,
+monitor_soak, battery_rundown) and takes a health snapshot (device/health.sh) at least every `health_interval_s`.
+Failures are classified from the host side, because a hypervisor fault rarely leaves a trace inside Android: the device
+dropping off adb (DEVICE_LOST / DEVICE_GONE), a boot id that changed without a planned reboot (UNEXPECTED_REBOOT, with
+the boot reasons and the pstore files of the previous boot pulled), a boot that never completes (BOOT_FAIL); then
+Android-side findings (new kernel oops/lockup/watchdog lines, crash-buffer entries, ANRs, tombstones), stress-tool
+failures and suspend failures. Kernel lines are attributed by their kernel time to the phase they happened in (a
+`STAB PHASE_START` marker in the kernel log at every phase start), not to the snapshot that collected them. Every event
+goes to events.jsonl and log.txt; summary.md is (re)written at the end, also after Ctrl-C or an abort. Python 3 stdlib
+only.
 """
-import argparse, collections, json, os, re, shlex, signal, statistics, subprocess, sys, time
+import argparse, collections, csv, datetime, json, os, re, shlex, signal, statistics, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import el2_report  # noqa: E402
+import rundown_report  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEV = '/data/local/tmp/stab'
 ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
 WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'STANDBY_SHORT', 'DEVICE_LOST', 'PROBE_TIMEOUT', 'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
-            'MONKEY_ANR', 'BOOT_REASON'}
+            'MONKEY_ANR', 'BOOT_REASON', 'RUNDOWN_INVALID', 'RESTORE_FAIL'}
 
 
 class Abort(Exception):
@@ -335,6 +337,200 @@ def standby_summary(cycles, suspend_s):
                   'on every suspend')
 
 
+RUNDOWN = f'{DEV}/rundown'
+# the battery's power supply directory into $B: the one named battery, else the first of type Battery
+BATTERY_DIR = ('B=/sys/class/power_supply/battery; [ -d $B ] || '
+               'B=$(dirname "$(grep -lx Battery /sys/class/power_supply/*/type 2>/dev/null | head -1)")')
+# settings the rundown changes, read before and restored after; the global ones are restored through their commands
+RUNDOWN_SETTINGS = ('system screen_brightness_mode', 'system screen_brightness', 'system peak_refresh_rate',
+                    'system min_refresh_rate', 'system accelerometer_rotation', 'system user_rotation',
+                    'global airplane_mode_on', 'global wifi_on', 'global bluetooth_on')
+VLC_PREP = ('the player needs its one-time preparation on this device (README, battery_rundown): open a video in VLC '
+            'once, close the video player introduction, set repeat to "repeat one" in the player menu')
+
+
+def lock_entries(name, fields):
+    """{key: fields} of the lines of third_party/<name> with at least `fields` columns (comments skipped)."""
+    out = {}
+    with open(os.path.join(REPO, 'third_party', name)) as f:
+        for line in f:
+            p = line.split()
+            if len(p) >= fields and not line.startswith('#'):
+                out[p[0]] = p
+    return out
+
+
+def sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    return h.hexdigest()
+
+
+def parse_volume(text):
+    """Index from `cmd media_session volume --get` ('... volume is 3 in range [0..15]'), else None."""
+    m = re.search(r'volume is (\d+)', text or '')
+    return int(m.group(1)) if m else None
+
+
+def hw_decoder(text, pid):
+    """(listed, codec name): whether dumpsys media.resource_manager lists a hw-video-codec resource for process pid
+    (its 'Pid: <n>' section; the whole dump when it has no such sections)."""
+    parts = re.split(r'\bPid:\s*(\d+)', text or '')
+    body = dict(zip(parts[1::2], parts[2::2])).get(str(pid), '') if len(parts) > 1 else (text or '')
+    m = re.search(r'Name:\s*(\S+)', body)
+    return 'hw-video-codec' in body, m.group(1) if m else ''
+
+
+def rundown_apply_cmds(p):
+    """Shell commands that put the device into the rundown's fixed state (plan parameters p)."""
+    hz = float(p['refresh_hz'])
+    radio = (['cmd connectivity airplane-mode enable', 'sleep 2', 'cmd wifi set-wifi-enabled disabled',
+              'cmd bluetooth_manager disable'] if p['airplane'] else [])
+    # Match content frame rate off (Android's default 1 lets a 60 fps video pull the panel to 60 Hz although
+    # min = peak = 90; seen on T11206, 2026-10-14). Not kept across a reboot.
+    return radio + ['settings put system screen_brightness_mode 0', f"settings put system screen_brightness {p['brightness']}",
+                    f'settings put system peak_refresh_rate {hz:.1f}', f'settings put system min_refresh_rate {hz:.1f}',
+                    'cmd display set-match-content-frame-rate-pref 0', 'settings put system accelerometer_rotation 0',
+                    'settings put system user_rotation 0', f"cmd media_session volume --stream 3 --set {p['volume']}"]
+
+
+def radio_on(key, value):
+    """Whether a radio setting's value means the radio is on now; None when the value was not read. global wifi_on: 1 on,
+    2 on in airplane mode, 3 off by airplane mode (remembered as on for its end), 0 off; global bluetooth_on: 1 on,
+    2 off by airplane mode, 0 off; global airplane_mode_on: 1 on."""
+    if value in (None, '', 'null'):
+        return None
+    return value in ('1', '2') if key == 'global wifi_on' else value == '1'
+
+
+def same_setting(key, a, b):
+    """Whether two values of a setting mean the same (radios: the same on/off state)."""
+    return radio_on(key, a) == radio_on(key, b) if key.startswith('global ') else a == b
+
+
+def rundown_restore_cmds(orig):
+    """Shell commands that bring back the settings read before the rundown (orig: rundown_read_settings); radios
+    through their commands by their on/off state (radio_on; the airplane mode first, then 2 s for it to settle),
+    'null' settings deleted, values not read left alone."""
+    air, wifi, bt = (radio_on(k, orig.get(k)) for k in ('global airplane_mode_on', 'global wifi_on', 'global bluetooth_on'))
+    cmds = []
+    if air is not None:
+        cmds += ['cmd connectivity airplane-mode ' + ('enable' if air else 'disable'), 'sleep 2']
+    if wifi is not None:
+        cmds.append('cmd wifi set-wifi-enabled ' + ('enabled' if wifi else 'disabled'))
+    if bt is not None:
+        cmds.append('cmd bluetooth_manager ' + ('enable' if bt else 'disable'))
+    for k in RUNDOWN_SETTINGS:
+        v = orig.get(k)
+        if k.startswith('system ') and v not in (None, ''):
+            cmds.append(f'settings delete {k}' if v == 'null' else f'settings put {k} {shlex.quote(v)}')
+    if orig.get('volume') is not None:
+        cmds.append(f"cmd media_session volume --stream 3 --set {orig['volume']}")
+    cmds.append(f"cmd display set-match-content-frame-rate-pref {orig.get('match_content', 1)}")
+    return cmds
+
+
+def restore_shell(serial, orig):
+    """The host command that restores the settings by hand (when the run could not: the device was away)."""
+    return f"adb -s {serial} shell {shlex.quote('; '.join(rundown_restore_cmds(orig)))}"
+
+
+def rundown_checks(st, p, pkg):
+    """Reasons the started rundown is not in its fixed state (st: rundown_state), empty when it is."""
+    bad = []
+    if st.get('playback') != 'PLAYING':
+        bad.append(f"playback state {st.get('playback')}, not PLAYING: {VLC_PREP}")
+    if pkg not in st.get('focus', ''):
+        bad.append(f"{pkg} not in focus ({st.get('focus', '').strip()[:120]})")
+    if not st.get('hw', (False,))[0]:
+        bad.append(f'no hw-video-codec resource for {pkg} (pid {st.get("pid") or "-"}) in dumpsys media.resource_manager')
+    if st.get('backlight') != str(p['brightness']):
+        bad.append(f"backlight raw value {st.get('backlight')!r}, not {p['brightness']}")
+    vs = st.get('vsync', [])
+    if not vs or any(not re.fullmatch(r'\d+(\.\d+)?', v) or abs(float(v) - float(p['refresh_hz'])) > 0.5 for v in vs):
+        bad.append(f"refresh rate {vs}, not {p['refresh_hz']} Hz")
+    if p['airplane']:
+        if st.get('airplane') != '1':
+            bad.append(f"airplane mode {st.get('airplane')!r}, not 1")
+        if 'disabled' not in st.get('wifi', '').lower():
+            bad.append(f"Wi-Fi not disabled ({st.get('wifi', '').strip()[:60]})")
+        if st.get('bluetooth') != '0':
+            bad.append(f"Bluetooth {st.get('bluetooth')!r}, not 0")
+    if st.get('volume') != p['volume']:
+        bad.append(f"media volume {st.get('volume')}, not {p['volume']}")
+    if not st.get('sampler'):
+        bad.append('the sampler (device/rundown.sh) is not running')
+    return bad
+
+
+def stamp_time(stamp, now):
+    """Epoch of a capture's 'HH:MM:SS.mmm' stamp on the host's date at `now` (the day before when that would be
+    later than now: a line from before midnight)."""
+    h, m, s = stamp.split(':')
+    t = datetime.datetime.fromtimestamp(now).replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+    e = t.timestamp() + float(s)
+    return e - 86400 if e > now + 60 else e
+
+
+class RundownLive:
+    """Follows the sampler's 'RUNDOWN <csv line>' kernel-log lines in a serial capture: appends them to the live file
+    (host time from the capture's stamp, then the sample), and returns INFO messages: the first sample on battery, every
+    10 % of capacity, and once no sample came for max(300 s, 5 samples) by the time this process saw them (never by
+    a file's modification time: it is stale after a host restart) that the device has probably shut down."""
+    LINE = re.compile(r'^(\d\d:\d\d:\d\d\.\d{3}) .*?RUNDOWN (.*?)\s*$')
+
+    def __init__(self, path, header, sample_s=60):
+        self.path, self.cols, self.quiet = path, header, max(300, 5 * sample_s)
+        self.part, self.n, self.bad = b'', 0, 0
+        self.seen_t = self.start = self.last = None  # start: device epoch of the first sample on battery
+        self.next_level, self.off = 90, False
+        if not os.path.exists(path):
+            with open(path, 'w') as f:
+                f.write(','.join(['host_time'] + header) + '\n')
+
+    def feed(self, chunk, now):
+        lines = (self.part + chunk).split(b'\n')
+        self.part = lines.pop()
+        out = []
+        for raw in lines:
+            if b'RUNDOWN ' not in raw:
+                continue
+            m = self.LINE.match(raw.decode('utf-8', 'replace').rstrip('\r'))
+            vals = next(csv.reader([m.group(2)])) if m else []
+            if len(vals) != len(self.cols) or not vals[0].isdigit():
+                self.bad += 1
+                continue
+            r = dict(zip(self.cols, vals))
+            ht = stamp_time(m.group(1), now)
+            with open(self.path, 'a') as f:
+                f.write(datetime.datetime.fromtimestamp(ht).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ',' + m.group(2) + '\n')
+            self.n, self.seen_t, self.last = self.n + 1, now, r
+            if self.off:
+                self.off = False
+                out.append(f"rundown: samples again after a pause ({r.get('cap')} %)")
+            if self.start is None and r.get('online') == '0':
+                self.start = fnum(r, 'epoch')
+                out.append(f"rundown: first sample on battery at {m.group(1)[:8]} (host clock): {r.get('cap')} %, "
+                           f"{fnum(r, 'volt_uV') / 1e6 if fnum(r, 'volt_uV') else 0:.3f} V")
+                self.next_level = min(90, ((num(r, 'cap', 100) - 1) // 10) * 10)
+            elif self.start is not None and num(r, 'cap', 100) <= self.next_level:
+                cap = num(r, 'cap')
+                v, i = fnum(r, 'volt_uV'), fnum(r, 'cur_uA')
+                w = f', {v * -i / 1e12:.2f} W' if v is not None and i is not None else ''
+                t = fnum(r, 'temp_dC')
+                out.append(f"rundown: {cap} % after {(fnum(r, 'epoch') - self.start) / 3600:.2f} h on battery"
+                           + (f', {v / 1e6:.3f} V' if v else '') + w + (f', {t / 10:.1f} C' if t is not None else ''))
+                self.next_level = ((cap - 1) // 10) * 10
+        if self.seen_t is not None and not self.off and now - self.seen_t >= self.quiet and self.start is not None:
+            self.off = True
+            out.append(f'rundown: no sample for {(now - self.seen_t) / 60:.0f} min (last {self.last.get("cap")} %, '
+                       f'{self.n} samples received): the device has probably shut down')
+        return out
+
+
 def step_names(steps):
     """Phase name of each el2_stress step: a repeated step is <step>-r2, -r3, ... (the first keeps the plain name)."""
     n, out = collections.Counter(), []
@@ -399,6 +595,7 @@ class Run:
         self.group_n = collections.Counter()  # (phase, group) -> preempt/IRQ-off reports seen
         self.kept_lines = []        # kernel lines of the previous snapshot (a WARN splat can span two snapshots)
         self.degraded = None        # boot id for which HEALTH_DEGRADED was reported
+        self.away = False           # battery_rundown: USB unplugged on purpose (no SERIAL_STALE: the device shuts down)
 
     # ------------------------------------------------------------------ records
     def event(self, kind, msg='', phase=None, **kw):
@@ -677,7 +874,7 @@ class Run:
             return
         end = os.path.getsize(self.serial)
         if end == self.serial_scan_off:
-            if not self.serial_stale:
+            if not self.serial_stale and not self.away:
                 self.serial_stale = True
                 self.event('SERIAL_STALE', f'no serial output since the last check ({self.serial}): capture stopped or '
                            'the adapter/wires are off')
@@ -769,7 +966,7 @@ class Run:
         if not self.dev.alive():
             raise Abort(f'device {self.dev.serial} not reachable')
         self.dev.su(f'mkdir -p {DEV}/tmp && chmod 777 {DEV} {DEV}/tmp')
-        files = [os.path.join(REPO, 'device', 'health.sh'), os.path.join(REPO, 'device', 'el2stress.sh')]
+        files = [os.path.join(REPO, 'device', f) for f in ('health.sh', 'el2stress.sh', 'rundown.sh')]
         tdir = os.path.join(REPO, 'third_party', 'out', 'aarch64')
         for t in ('stress-ng', 'stressapptest', 'cyclictest', 'hackbench'):
             if os.path.exists(os.path.join(tdir, t)):
@@ -1177,6 +1374,365 @@ class Run:
             self.wait(60, 'monitor')
         subprocess.run(['bash', script, 'stop', '-s', self.dev.serial], capture_output=True)
 
+    # ------------------------------------------------------------------ battery rundown
+    def ensure_media(self, key):
+        """(device path, sha256) of media file `key` of third_party/media.lock in /sdcard/Movies/: the device copy when
+        its sha256 matches the lock, else pushed from STAB_MEDIA_DIR after checking its size and sha256 there."""
+        lock = lock_entries('media.lock', 4)
+        if key not in lock:
+            raise Abort(f'media {key}: not in third_party/media.lock')
+        _, fname, size, sha = lock[key][:4]
+        path = f'/sdcard/Movies/{fname}'
+        have = lambda: (self.dev.sh(f'sha256sum {path} 2>/dev/null', timeout=300)[1] or '').split()[:1] == [sha]
+        if have():
+            self.event('INFO', f'media {key}: {path} on the device matches the lock')
+            return path, sha
+        d = os.environ.get('STAB_MEDIA_DIR', '')
+        host = os.path.join(d, fname)
+        if not d or not os.path.exists(host):
+            raise Abort(f'media {key}: {path} missing or different on the device, and {fname} not found in '
+                        f'STAB_MEDIA_DIR ({d or "unset"})')
+        if os.path.getsize(host) != int(size) or sha256_file(host) != sha:
+            raise Abort(f'media {key}: {host} does not match the size and sha256 in third_party/media.lock')
+        self.dev.sh('mkdir -p /sdcard/Movies', timeout=30)
+        rc, out = self.dev.adb('push', host, path, timeout=1800)
+        if not have():
+            raise Abort(f'media {key}: push to {path} failed (adb rc {rc}): {out.strip()[-160:]}')
+        self.event('INFO', f'media {key}: pushed {fname} to {path}')
+        return path, sha
+
+    def rundown_identity(self, pkg, ver, clip, apk_file):
+        """Appends the rundown's conditions to identity.txt: kernel command line and console log level (the vendor kernel
+        on T11206 prints ~270 lines a second during playback, which costs power, so the runs compared must have the
+        same), the battery's uevent, the player's version and the clip; Abort when the player is not version `ver`."""
+        _, out = self.dev.sh(f'cat /proc/cmdline; echo "printk $(cat /proc/sys/kernel/printk)"; {BATTERY_DIR}; '
+                             'echo "battery $(tr "\\n" " " < $B/uevent)"; '
+                             f'dumpsys package {pkg} | grep -m2 -oE "versionName=[^ ]+|versionCode=[0-9]+"', timeout=60)
+        with open(os.path.join(self.out, 'identity.txt'), 'a') as f:
+            f.write(f'--- battery_rundown\n{out.strip()}\nclip {clip[0]} sha256 {clip[1]}\n')
+        m = re.search(r'versionName=(\S+)', out or '')
+        if not m:
+            raise Abort(f'battery_rundown: {pkg} not installed (put {apk_file} in STAB_APK_DIR)')
+        if m.group(1) != ver:
+            raise Abort(f'battery_rundown: {pkg} {m.group(1)} installed, the plan wants {ver} (third_party/apks.lock)')
+
+    def rundown_read_settings(self):
+        """Every setting the rundown changes, as it is now (restored at the end and on an abort before the unplug)."""
+        orig = {}
+        for k in RUNDOWN_SETTINGS:
+            rc, out = self.dev.sh(f'settings get {k}', timeout=30)
+            if rc == 0:
+                orig[k] = out.strip()
+        orig['volume'] = parse_volume(self.dev.sh('cmd media_session volume --stream 3 --get', timeout=30)[1])
+        _, out = self.dev.sh('cmd display get-match-content-frame-rate-pref', timeout=30)
+        m = re.findall(r'\b([0-2])\b', out or '')
+        orig['match_content'] = int(m[-1]) if m else 1  # 1: Android's default (seamless switches only)
+        return orig
+
+    def rundown_restore(self, orig):
+        """Puts back the settings read before the run (rundown_restore_cmds) and reads them back; when Wi-Fi was on,
+        first waits up to 30 s for it (the next snapshot compares the device inventory with one taken with Wi-Fi on).
+        RESTORE_FAIL with the command to run by hand when the device does not answer or a setting stays different;
+        returns True when all came back."""
+        self.dev.sh('; '.join(rundown_restore_cmds(orig)), timeout=120)
+        time.sleep(3)
+        if radio_on('global wifi_on', orig.get('global wifi_on')):
+            for _ in range(10):
+                if 'is enabled' in (self.dev.sh('cmd wifi status | head -1', timeout=30)[1] or ''):
+                    break
+                time.sleep(3)
+        now = self.rundown_read_settings()
+        if not any(k in now for k in RUNDOWN_SETTINGS):
+            self.event('RESTORE_FAIL', 'settings not restored, the device does not answer; restore them by hand: '
+                       + restore_shell(self.dev.serial, orig))
+            return False
+        diff = [f'{k} {orig[k]} -> {now.get(k)}' for k in RUNDOWN_SETTINGS + ('volume',)
+                if orig.get(k) not in (None, '') and not same_setting(k, orig[k], now.get(k))]
+        if diff:
+            self.event('RESTORE_FAIL', f'settings restored, still different: {", ".join(diff)}; by hand: '
+                       + restore_shell(self.dev.serial, orig))
+            return False
+        self.event('INFO', 'settings restored')
+        return True
+
+    def rundown_stop(self, pkg):
+        """Sampler (its pid file removed: it ends before its next sample) and player stopped."""
+        self.dev.su(f'rm -f {RUNDOWN}/rundown.pid', timeout=30)
+        self.dev.sh(f'am force-stop {pkg}', timeout=30)
+
+    def rundown_up(self):
+        """Whether the device answers on adb with its boot completed (its settings can be written)."""
+        return self.dev.alive() and (self.dev.sh('getprop sys.boot_completed', timeout=10)[1] or '').strip() == '1'
+
+    def rundown_abandon(self, stage, orig, pkg, path):
+        """The run stopped after the settings were applied and before they were put back (an abort, a timeout, an
+        exception, Ctrl-C or SIGTERM; stage: before the unplug, away, back): on a device that answers with its boot
+        completed, sampler and player stopped and settings restored; otherwise RESTORE_FAIL saying what stays on the
+        device and how to restore the settings and get the samples."""
+        if self.rundown_up():
+            self.rundown_stop(pkg)
+            self.rundown_restore(orig)
+            return
+        when = {'before': 'before the USB unplug', 'away': 'while the device was away'}.get(stage, 'after its return')
+        self.event('RESTORE_FAIL', f'the run stopped {when} and the device does not answer (USB unplugged, or not '
+                   'booted): settings stay as set' + (', the sampler and the player run until the automatic shutdown; '
+                                                      f'samples in {path} on the device (copy them to '
+                                                      'rundown-device.csv in the run directory, then rundown_report.py '
+                                                      '<run dir>)' if path else '')
+                   + f'; once it is back, restore the settings with: {restore_shell(self.dev.serial, orig)}')
+
+    def rundown_wait_full(self, p):
+        """Waits on USB power until the battery reads 100 % and Full (charge_timeout_h, else Abort)."""
+        end, shown = time.time() + p['charge_timeout_h'] * 3600, None
+        while True:
+            _, out = self.dev.sh(f'{BATTERY_DIR}; echo "BAT $(cat $B/capacity) $(cat $B/status)"', timeout=30)
+            m = re.search(r'BAT (\d+) (.+)', out or '')
+            cap, status = (int(m.group(1)), m.group(2).strip()) if m else (None, '?')
+            if cap is not None and cap >= 100 and status == 'Full':
+                self.event('INFO', 'battery full (100 %, Full)')
+                return
+            if time.time() >= end:
+                raise Abort(f"battery_rundown: battery not full after {p['charge_timeout_h']} h on USB ({cap} %, {status})")
+            if shown != (cap // 10 if cap is not None else None, status):
+                shown = (cap // 10 if cap is not None else None, status)
+                self.event('INFO', f'charging: {cap} % {status}; waiting for 100 % and Full')
+            self.wait(60, 'charging')
+
+    def rundown_start_sampler(self, p, pkg):
+        """device/rundown.sh started detached as root (it survives the USB unplug) on a new file; (path, columns)."""
+        path = f"{RUNDOWN}/rundown-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+        _, out = self.dev.su(f'mkdir -p {RUNDOWN} && rm -f {RUNDOWN}/rundown.pid; setsid nohup sh {DEV}/rundown.sh {path} '
+                             f"{int(p['sample_s'])} {pkg} > /dev/null 2>&1 < /dev/null & sleep 3; head -1 {path}",
+                             timeout=60)
+        head = next((l.strip() for l in (out or '').splitlines() if l.startswith('epoch,')), '')
+        if not head:
+            raise Abort('battery_rundown: the sampler did not start: ' + ' '.join((out or '').split())[-200:])
+        self.event('INFO', f"rundown sampler started: {path}, a sample every {p['sample_s']} s")
+        return path, head.split(',')
+
+    def rundown_start_player(self, p, pkg, clip):
+        """Grants the player its permissions and plays the clip from its start in the video player.
+        TODO(vlc-prefs): the one-time preparation (VLC_PREP: player introduction closed, repeat one) is done by hand on
+        each install; automate it by writing VLC's shared preferences (/data/data/<pkg>/shared_prefs/) once the keys
+        that hold the two are read from a prepared device."""
+        for perm in ('READ_MEDIA_VIDEO', 'READ_MEDIA_AUDIO', 'POST_NOTIFICATIONS'):  # failures do not matter
+            self.dev.sh(f'pm grant {pkg} android.permission.{perm}', timeout=30)
+        self.dev.sh(f'appops set {pkg} MANAGE_EXTERNAL_STORAGE allow', timeout=30)
+        self.screen(True)
+        _, out = self.dev.sh(f'am force-stop {pkg}; sleep 1; am start -W -a android.intent.action.VIEW -d file://{clip} '
+                             f"-t video/mp4 --ez from_start true -n {pkg}/{p['activity']}", timeout=90)
+        self.save('rundown-player-start.txt', out or '')
+        time.sleep(15)
+
+    def rundown_state(self, pkg):
+        """What the started rundown looks like (checked by rundown_checks before the unplug)."""
+        st = {'playback': self.music_state(pkg)}
+        st['focus'] = self.dev.sh('dumpsys window | grep -m1 mCurrentFocus', timeout=60)[1] or ''
+        st['pid'] = ((self.dev.sh(f'pidof {pkg}', timeout=30)[1] or '').split() or [''])[0]
+        st['hw'] = hw_decoder(self.dev.sh('dumpsys media.resource_manager', timeout=60)[1], st['pid'])
+        st['backlight'] = (self.dev.sh('cat "$(ls -d /sys/class/backlight/* | head -1)/actual_brightness"',
+                                       timeout=30)[1] or '').strip()
+        st['vsync'] = []
+        for i in range(3):  # three reads over about 10 s
+            if i:
+                time.sleep(5)
+            o = self.dev.sh("dumpsys SurfaceFlinger | grep -m1 -oE 'vsyncRate=[0-9.]+'", timeout=60)[1] or ''
+            st['vsync'].append(o.strip().partition('=')[2])
+        for k, cmd in (('airplane', 'settings get global airplane_mode_on'), ('wifi', 'cmd wifi status | head -1'),
+                       ('bluetooth', 'settings get global bluetooth_on')):
+            st[k] = (self.dev.sh(cmd, timeout=30)[1] or '').strip()
+        st['volume'] = parse_volume(self.dev.sh('cmd media_session volume --stream 3 --get', timeout=30)[1])
+        st['sampler'] = 'SAMPLER_UP' in (self.dev.su(f'kill -0 "$(cat {RUNDOWN}/rundown.pid)" 2>/dev/null && '
+                                                     'echo SAMPLER_UP', timeout=30)[1] or '')
+        return st
+
+    def rundown_wait_unplug(self, p):
+        """Waits for the USB unplug (unplug_timeout_min, else Abort): adb gone, and still gone 5 s later (a moment
+        without an answer, e.g. an adb server restarted by another tool, is not the unplug). Returns the boot id the
+        run is on."""
+        boot = (self.last or {}).get('boot_id')
+        end = time.time() + p['unplug_timeout_min'] * 60
+        while True:
+            if not self.dev.wait_drop(max(0, end - time.time())):
+                raise Abort(f"battery_rundown: USB still connected {p['unplug_timeout_min']} min after the request")
+            time.sleep(5)
+            if not self.dev.alive():
+                return boot
+            self.event('INFO', 'adb did not answer for a moment but the device is back: not the unplug, still waiting')
+
+    def rundown_follow(self, live, off):
+        """Feeds the serial capture's growth since byte `off` to live (RundownLive) and scans it for fatal markers (no
+        SERIAL_STALE: the line goes quiet after the shutdown); returns the new offset. A shorter file is a new capture
+        (restarted): both offsets start over."""
+        try:
+            end = os.path.getsize(self.serial)
+        except OSError:
+            return off
+        off = 0 if end < off else off  # a new capture file
+        if end < self.serial_scan_off:
+            self.serial_scan_off = 0
+        was, msgs = live.off, []
+        with open(self.serial, 'rb') as f:
+            f.seek(off)
+            while off < end:
+                b = f.read(min(8 << 20, end - off))
+                if not b:
+                    break
+                msgs += live.feed(b, time.time())
+                off += len(b)
+        msgs += live.feed(b'', time.time())  # the quiet check, also without new bytes
+        for m in msgs:
+            self.event('INFO', m)
+        self.serial_marks = (self.serial_marks + [(time.time(), end)])[-50:]
+        if live.off and not was:
+            self.serial_extract('rundown-end', before_s=900)
+        if end > self.serial_scan_off:
+            self.serial_scan()
+        return off
+
+    def rundown_away(self, p, head, soff):
+        """USB unplugged: no health snapshots, no lost-device handling and no SERIAL_STALE while the device is away on
+        purpose (self.away, cleared on its return). With a serial capture the sampler's lines go to rundown-live.csv;
+        a failure of this live view ends only the view. Returns once the device is back on adb with its boot completed
+        (return_timeout_h after the unplug, else Abort); on an Abort or Ctrl-C the report is written from the live
+        view first."""
+        t0, told, self.away = time.time(), False, True
+        end = t0 + p['return_timeout_h'] * 3600
+        self.event('INFO', f"USB unplugged: device away; after the automatic shutdown plug USB back in and power the "
+                   f"device on (waiting up to {p['return_timeout_h']} h)" + (
+                       '; live samples from the serial console in rundown-live.csv' if self.serial else
+                       '; no --serial-log: no live view'))
+        live = RundownLive(os.path.join(self.out, 'rundown-live.csv'), head, p['sample_s']) if self.serial else None
+        view = bool(live)
+
+        def follow():
+            nonlocal soff, view
+            try:
+                soff = self.rundown_follow(live, soff)
+            except Exception as e:  # a side channel: it never ends the run
+                view = False
+                self.event('INFO', f'rundown: live view stopped ({e!r}); waiting for the device goes on')
+        try:
+            while True:
+                if view:
+                    follow()
+                if self.dev.alive():
+                    if (self.dev.sh('getprop sys.boot_completed', timeout=10)[1] or '').strip() == '1':
+                        break
+                    if not told:
+                        told = True
+                        self.event('INFO', 'device on adb, boot not completed (charger mode?): power it on')
+                if time.time() >= end:
+                    raise Abort(f"battery_rundown: device not back {p['return_timeout_h']} h after the unplug")
+                time.sleep(30)
+        except BaseException:
+            if live and live.n:  # what the serial console carried is the result so far
+                rundown_report.report_dir(self.out)
+                self.event('INFO', f'rundown-summary.md written from the live view ({live.n} samples); after pulling '
+                           'the device file into rundown-device.csv, rundown_report.py <run dir> writes it again')
+            raise
+        if view:
+            follow()
+        self.away = False
+        self.event('INFO', f'device back on adb and booted {rundown_report.hm(time.time() - t0)} after the unplug')
+
+    def rundown_collect(self, path, pkg):
+        """After the return: sampler and player stopped (both still run when USB came back before a shutdown), the
+        device's sample file pulled into rundown-device.csv."""
+        self.rundown_stop(pkg)
+        rc, data = self.dev.su(f'cat {path}', timeout=120)
+        if rc == 0 and (data or '').startswith('epoch,'):
+            self.save('rundown-device.csv', data.replace('\r', ''))
+        else:
+            self.event('RUNDOWN_INVALID', f'device sample file {path} not read back (rc {rc}); the report uses '
+                       'rundown-live.csv if there is one')
+
+    def rundown_finish(self, boot):
+        """After the return, with the samples pulled and the settings restored: a new boot is expected (no
+        UNEXPECTED_REBOOT), the boot reasons are recorded, the report written. A new boot although the device's samples
+        show the battery did not run down (none on battery: it restarted before the unplug; the last one above 5 %:
+        it restarted or shut down on battery) is an unexpected reboot after all (UNEXPECTED_REBOOT with its boot
+        reasons and pstore files)."""
+        prev = self.last
+        self.expect_reboot = True
+        try:
+            h = self.snapshot('rundown-back')
+        finally:
+            self.expect_reboot = False
+        new = h.get('boot_id') != boot
+        _, br = self.dev.sh('getprop sys.boot.reason.last; getprop persist.sys.boot.reason.history | head -3', timeout=30)
+        self.save('rundown-boot-reason.txt', br or '')
+        self.event('INFO', ('new boot after the rundown, as expected' if new else
+                            'same boot as before the unplug: USB came back before a shutdown')
+                   + '; boot reason (last, history): ' + ' | '.join((br or '').split())[:200])
+        res = rundown_report.report_dir(self.out)
+        if 'duration_s' in res:
+            self.event('INFO', f"rundown: {rundown_report.hm(res['duration_s'])} on battery, "
+                       f"{rundown_report.f0(res['start_cap'], ' %')} to {rundown_report.f0(res['end_cap'], ' %')}"
+                       + (f", {res['energy_wh']:.2f} Wh, average {res['avg_w']:.3f} W" if 'energy_wh' in res else '')
+                       + ' (rundown-summary.md)')
+        for k, v in res['flags'].items():
+            first = (f", first {rundown_report.hm(v['first_s'])} into the run at {v['cap']:.0f} %"
+                     if v['first_s'] is not None and v['cap'] is not None else '')
+            self.event('RUNDOWN_INVALID', f"{k}: {v['count']} samples{first}: {rundown_report.FLAGS[k]}"
+                       + (f" ({v['detail']})" if v['detail'] else ''))
+        early = ('never_unplugged' in res['flags'] or 'not_run_down' in res['flags'])
+        if new and early and prev and res['samples'] and res.get('source') == 'rundown-device.csv':
+            self.event('INFO', 'the device restarted before its battery ran down ('
+                       + ('never on battery' if 'never_unplugged' in res['flags'] else
+                          f"last sample {rundown_report.f0(res.get('end_cap'), ' %')}") + '): an unexpected reboot')
+            self.unexpected_reboot(prev, h)
+
+    def phase_battery_rundown(self, p):
+        """Video playback battery life from full charge to the automatic shutdown (README, battery_rundown): identity and
+        settings recorded, battery charged to full, settings applied, sampler and player started and checked; then
+        the operator unplugs USB; the device is away until it is powered on again; then sampler and player are stopped,
+        the sample file pulled, settings restored (before the first snapshot of the new boot), report written. Whenever
+        the run stops before that restore (an abort, a timeout, an exception, Ctrl-C or SIGTERM, in any stage), a device
+        that answers gets the same stop and restore, and one that does not gets a RESTORE_FAIL with the command."""
+        p = {**rundown_report.DEFAULTS, **p}
+        apk = lock_entries('apks.lock', 6).get(p['apk'])
+        if not apk:
+            raise Abort(f"battery_rundown: apk {p['apk']} not in third_party/apks.lock")
+        pkg, ver = apk[2], apk[3]
+        clip = self.ensure_media(p['media'])
+        self.ensure_apks([p['apk']])
+        self.rundown_identity(pkg, ver, clip, apk[1])
+        orig = self.rundown_read_settings()
+        self.save('rundown-settings.json', json.dumps({'original': orig, 'restore': rundown_restore_cmds(orig),
+                                                      'restore_shell': restore_shell(self.dev.serial, orig)},
+                                                     indent=1) + '\n')
+        self.event('INFO', 'rundown: settings before the run: ' + ', '.join(f'{k}={v}' for k, v in orig.items()))
+        stage, path = 'charging', None  # nothing changed while charging; then before (the unplug), away, back, restored
+        try:
+            self.rundown_wait_full(p)
+            stage = 'before'
+            self.save('rundown-settings-apply.txt', self.dev.sh('; '.join(rundown_apply_cmds(p)), timeout=120)[1] or '')
+            soff = os.path.getsize(self.serial) if self.serial and os.path.exists(self.serial) else 0
+            path, head = self.rundown_start_sampler(p, pkg)
+            self.rundown_start_player(p, pkg, clip[0])
+            st = self.rundown_state(pkg)
+            self.save('rundown-start-state.json', json.dumps(st, indent=1) + '\n')
+            bad = rundown_checks(st, p, pkg)
+            if bad:
+                raise Abort('battery_rundown not started: ' + '; '.join(bad))
+            self.event('INFO', f"rundown ready: {pkg} playing {clip[0]} (hardware decoder {st['hw'][1] or '?'}), "
+                       f"backlight {st['backlight']}, refresh {'/'.join(st['vsync'])} Hz, volume {st['volume']}")
+            msg = f"UNPLUG USB NOW: the rundown starts when USB is unplugged (waiting up to {p['unplug_timeout_min']} min)"
+            print('\n' + '=' * 100 + f'\n    {msg}\n' + '=' * 100 + '\n', flush=True)
+            self.event('INFO', msg)
+            boot = self.rundown_wait_unplug(p)
+            stage = 'away'
+            self.rundown_away(p, head, soff)
+            stage = 'back'
+            self.rundown_collect(path, pkg)
+            self.rundown_restore(orig)
+            stage = 'restored'
+            self.rundown_finish(boot)
+        finally:
+            if stage in ('before', 'away', 'back'):
+                self.rundown_abandon(stage, orig, pkg, path)
+
     # ------------------------------------------------------------------ driver
     def execute(self, expect_sha):
         self.save('plan.json', json.dumps(self.plan, indent=2, ensure_ascii=False))
@@ -1221,6 +1777,21 @@ def count(evs):
     return sum(e.get('count', 1) for e in evs)
 
 
+def rundown_lines(out):
+    """The battery rundown's line of summary.md (rundown.json written by rundown_report), or none."""
+    try:
+        with open(os.path.join(out, 'rundown.json')) as f:
+            r = json.load(f)
+    except (OSError, ValueError):
+        return []
+    fl = ', '.join(f"{k} x{v['count']}" for k, v in r['flags'].items()) or 'no flags'
+    if 'duration_s' not in r:
+        return [f'- battery rundown: rundown-summary.md (no run on battery; validity: {fl})']
+    return [f"- battery rundown: rundown-summary.md ({rundown_report.hm(r['duration_s'])} on battery"
+            + (f", {r['energy_wh']:.2f} Wh, average {r['avg_w']:.3f} W" if 'energy_wh' in r else '')
+            + f'; validity: {fl})']
+
+
 def write_summary(out):
     evs = [json.loads(l) for l in open(os.path.join(out, 'events.jsonl')) if l.strip()]
     errors = [e for e in evs if e['kind'] in ERRORS]
@@ -1231,6 +1802,7 @@ def write_summary(out):
     verdict = 'FAIL' if errors or any(e['kind'] == 'ABORT' for e in evs) else 'PASS'
     L = [f'# Stability run {os.path.basename(out)}: {verdict}', '', f'- identity: `{ident}`',
          *(['- EL2 parallel log: el2-summary.md, el2-per-second.csv'] if os.path.exists(os.path.join(out, 'el2-summary.md')) else []),
+         *rundown_lines(out),
          f'- events: {count(evs)}; errors {count(errors)}; warnings {count(warns)} (an event with a count stands for '
          'that many findings of one kind)', '', '| kind | count |', '|---|---|']
     kinds = collections.Counter()

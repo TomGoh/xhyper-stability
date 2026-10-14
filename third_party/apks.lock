@@ -10,3 +10,4 @@ cpdt  CPDT.apk  com.Saplin.CPDT  2.4.1  39dad551b2fd83e1454a029fc6d3f3d5aa59adf0
 factorytest  factory_test_stable_v1.apk  com.kylinos.factorytest  1.0  e4844809a44845190d42d6727d37d1c4587a3a2a29d52b913eeb5dee14873557  -  colleague test package v1.62 (needs the platform signature to run as system)
 gfxbench  GFXBench_5.1.0.apk  com.glbenchmark.glbenchmark27  5.1.0  0a79c49ac3e7e3002127cd42227492657479ab9bd4313c9258a2c755799136b7  -  colleague test package v1.62
 3dmark  3DMark_v2.6.5025.apk  com.futuremark.dmandroid.application  2.6.5025  8806e8453a7835ea85fbd2109ab8d41ebe29fa74082608e6390a4932912088fa  -  colleague test package v1.62
+vlc  VLC-Android-3.7.1-arm64-v8a.apk  org.videolan.vlc  3.7.1  bea9ea0cdecfd8f461ef305d2afe5d1ac1459cfb9156acce2f615788a486de74  -  VLC for Android (GPLv2+/LGPLv2.1+), https://get.videolan.org/vlc-android/3.7.1/
