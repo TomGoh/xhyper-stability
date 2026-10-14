@@ -47,7 +47,7 @@ ipi() {
 timer() { ng --timer $(n4 8 4) --timer-freq $(n4 50000 20000) --itimer $(n4 4 2) --clock $(n4 2); }
 idle() { ng --sleep $(n4 16 4) --sleep-max $(n4 256 64); }
 traffic() {
-  [ -n "$GW" ] && { timeout $T ping -f -q $GW > $TMP/ping.log 2>&1; echo "EL2STRESS $S ping $(tail -2 $TMP/ping.log | tr '\n' ' ')"; } &
+  [ -n "$GW" ] && { timeout -s INT $T ping -f -q $GW > $TMP/ping.log 2>&1; echo "EL2STRESS $S ping $(tail -2 $TMP/ping.log | tr '\n' ' ')"; } &
   until_end sh -c "dd if=/dev/zero of=$TMP/dd.bin bs=1048576 count=128 conv=fsync; rm -f $TMP/dd.bin"
   echo "EL2STRESS $S storage rc=0"; wait
 }
