@@ -12,7 +12,8 @@
 | `device/health.sh` | 设备端只读快照（以 root 运行）：开机号、开机原因、睡眠计数、频率、温度、pstore、内核异常行、崩溃缓冲区、无响应 |
 | `host/rundown_report.py` | 续航测试的报告：单次结果（`rundown-summary.md`）和多次运行的对比表；也能直接读一个采样文件 |
 | `device/rundown.sh` | 续航测试的设备端采样脚本（以 root 脱离 adb 运行，拔掉 USB 后照常采样） |
-| `plans/*.json` | 测试计划：`smoke.json`（每个阶段跑一次，约 20 分钟），`overnight.json`（约 12 小时），`battery-rundown.json`（视频播放续航，满电到自动关机） |
+| `device/klogwatch.sh` | 在设备上跟踪内核日志（`dmesg -w`），只留下匹配的记录及其续行，供 `tee_idle` 统计；不怕内核环形缓冲区回绕 |
+| `plans/*.json` | 测试计划：`smoke.json`（每个阶段跑一次，约 20 分钟），`overnight.json`（约 12 小时），`battery-rundown.json`（视频播放续航，满电到自动关机），`tee-idle.json`（TEE 负载下分段开关深度空闲，约 35 分钟） |
 | `third_party/apks.lock` | 测试会安装的 APK 清单（文件名、包名、版本、sha256）；APK 本身不进仓库（许可、体积、内部应用），运行时从 `STAB_APK_DIR` 目录取，哈希对上才装 |
 | `third_party/media.lock` | 测试要播放的媒体文件清单（文件名、大小、sha256、许可和来源）；文件本身不进仓库，运行时从 `STAB_MEDIA_DIR` 目录取，大小和哈希对上、且设备上 `/sdcard/Movies/` 里的副本哈希不同时才推送 |
 | `third_party/` | 公开压力工具的固定版本和静态 aarch64 构建脚本（stress-ng、stressapptest、rt-tests 的 cyclictest），以及 Fastbot 的拉取脚本；编出的程序不入库 |
@@ -41,7 +42,16 @@ python3 host/stab.py report <输出目录>      # 重新生成 summary.md
 | `standby` | 灭屏后在 `hours` 小时内反复强制睡眠（每次 `suspend_s` 秒），记下每次到 adb 重新连上的实际时长和唤醒原因；中位数不到请求时长一半时记 `STANDBY_SHORT`（警告：插着 USB 供电时，厂商充电管理每次睡眠都安排几秒后的唤醒闹钟，测不到长待机）。这时每次循环约 60 秒，`hours: 2` 约 115 次循环、230 次健康快照；睡眠被拒（adb 没断开）的那次不计入时长统计 | 长时间深度睡眠后的恢复 |
 | `el2_stress` | `device/el2stress.sh` 按退出类型逐项施压，每项后记 EL2 占比（平行日志）和串口上的热点路径计数：`ipi`（membarrier、TLB 击落、hackbench）、`timer`（高频 POSIX 定时器）、`idle`（大量短睡眠）、`traffic`（Wi-Fi ping 洪泛、fsync 写盘、USB 大流量）、`affinity`（轮换忙碌中断的路由）、`hotplug`（1–7 号核反复上下线）、`radio`（Wi-Fi 与蓝牙关开）、`copy`（写盘、丢页缓存、读回比 md5）、`pmu`（满负载下 10 kHz 全系统采样，关掉内核限流，先停监视器）、`all`（同时） | 中断注入与就地应答、核间中断陷入、分发器访问、电源调用、PMU 溢出路径 |
 | `monitor_soak` | （可选）启用 EL2 监视器后加压，检查各核 EL2 周期单调递增 | 监视器与电源括号 |
+| `tee_idle` | 不带 cyclictest 跑 TEE 负载（`el2stress.sh` 的 `tee` 步骤），分段打开、关闭各核的深度空闲（默认开、关、再开，各 600 秒），统计每段里栈上有 `trusty_std_call_helper` 的关中断报告（见下文） | TEE 调用转发、Trusty 通知中断、深度空闲进出 |
 | `battery_rundown` | 视频播放续航：充满电后按固定条件循环播放视频，操作员按提示拔掉 USB，一直放到自动关机；再插上 USB 开机后取回采样，算出时长、能量和平均功率，并检查条件是否一直成立（见下节） | 长时间播放下的整机功耗：中断注入、空闲进出、各簇调频 |
+
+## TEE 与深度空闲（tee_idle）
+
+这是 T11206 上 TEE 修复的回归检查。修复之前，一次 Trusty 调用会让 Linux 一侧的中断关上几百毫秒，而且只在各核用深度空闲时出现：cyclictest 每毫秒的定时器让各核进不了深度空闲，所以带 cyclictest 的 `tee` 步骤看不到它。这个阶段用同样的 TEE 负载（`TEE_CYCLIC=0`，工作进程数 `workers`），按 `blocks` 分段运行，每段把各核 1 号及以上的空闲状态全部打开或全部关闭（`deep_idle`），段的前后往内核日志写 `STAB TEE_IDLE <段> start|end`。设备上另起一个脱离 adb 的 `device/klogwatch.sh` 跟踪内核日志，只留关中断报告（连同栈）和这些标记，所以不需要串口也能统计；带 `--serial-log` 时再从串口抓取文件里按同样的标记统计一遍，两边的数都报出来作交叉核对。
+
+每段报告：TEE 操作数和失败数、Trusty 中断数，栈上有 `trusty_std_call_helper` 的关中断报告在 `threshold_ms`（默认 30）毫秒及以上和 100 毫秒及以上各有几次，最长的 5 次，以及调用点（栈里 `trusty_std_call32` 的偏移；在 T11206 的这版 trusty 模块里 `+0xac` 是第一次调用，`+0xe4` 是被打断后的重新进入）。每段一条事件；设备日志和串口两份里任一份有 `threshold_ms` 及以上的报告时记 `TEE_IRQSOFF`（警告；按报告多的那一份写最长的几次和调用点；深度空闲关闭的段里出现同样记，消息写明是哪种），健康快照对 100 毫秒及以上报告的原有定级不变。结果写进 `tee-idle.json`，`summary.md` 里有一张表。阶段开始时记下各核空闲状态原来的 `disable` 值（`tee-idle-cpuidle.txt`），结束、中止或 Ctrl-C 时都写回去，读回不对时记 `RESTORE_FAIL`（警告）。停负载和日志跟踪时先核对进程的命令行还是它们自己（中途重启过的话，记下的进程号可能已经是别的进程）；上次被强行结束时留下的日志跟踪进程也在开始时停掉。
+
+在原厂镜像和虚拟化层镜像上各跑一次 `plans/tee-idle.json`（约 35 分钟，不开 EL2 监视器：它的采样中断也会让各核离开深度空闲）。2026-10-14 在 T11206 上，修复前三段分别有 6、0、1 次 30 毫秒及以上的报告，修复后是 0、0、0。
 
 ## 视频播放续航（battery_rundown）
 

@@ -5,15 +5,15 @@
   stab.py report DIR
 
 A run executes the plan's phases in order (reboot_loop, soak, suspend, memtest, latency, standby, el2_stress,
-monitor_soak, battery_rundown) and takes a health snapshot (device/health.sh) at least every `health_interval_s`.
-Failures are classified from the host side, because a hypervisor fault rarely leaves a trace inside Android: the device
-dropping off adb (DEVICE_LOST / DEVICE_GONE), a boot id that changed without a planned reboot (UNEXPECTED_REBOOT, with
-the boot reasons and the pstore files of the previous boot pulled), a boot that never completes (BOOT_FAIL); then
-Android-side findings (new kernel oops/lockup/watchdog lines, crash-buffer entries, ANRs, tombstones), stress-tool
-failures and suspend failures. Kernel lines are attributed by their kernel time to the phase they happened in (a
-`STAB PHASE_START` marker in the kernel log at every phase start), not to the snapshot that collected them. Every event
-goes to events.jsonl and log.txt; summary.md is (re)written at the end, also after Ctrl-C or an abort. Python 3 stdlib
-only.
+monitor_soak, battery_rundown, tee_idle) and takes a health snapshot (device/health.sh) at least every
+`health_interval_s`. Failures are classified from the host side, because a hypervisor fault rarely leaves a trace
+inside Android: the device dropping off adb (DEVICE_LOST / DEVICE_GONE), a boot id that changed without a planned
+reboot (UNEXPECTED_REBOOT, with the boot reasons and the pstore files of the previous boot pulled), a boot that never
+completes (BOOT_FAIL); then Android-side findings (new kernel oops/lockup/watchdog lines, crash-buffer entries, ANRs,
+tombstones), stress-tool failures and suspend failures. Kernel lines are attributed by their kernel time to the phase
+they happened in (a `STAB PHASE_START` marker in the kernel log at every phase start), not to the snapshot that
+collected them. Every event goes to events.jsonl and log.txt; summary.md is (re)written at the end, also after Ctrl-C
+or an abort. Python 3 stdlib only.
 """
 import argparse, collections, csv, datetime, json, os, re, shlex, signal, statistics, subprocess, sys, time
 
@@ -26,7 +26,7 @@ DEV = '/data/local/tmp/stab'
 ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
           'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
 WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'STANDBY_SHORT', 'DEVICE_LOST', 'PROBE_TIMEOUT', 'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
-            'MONKEY_ANR', 'BOOT_REASON', 'RUNDOWN_INVALID', 'RESTORE_FAIL'}
+            'MONKEY_ANR', 'BOOT_REASON', 'RUNDOWN_INVALID', 'RESTORE_FAIL', 'TEE_IRQSOFF'}
 
 
 class Abort(Exception):
@@ -531,6 +531,120 @@ class RundownLive:
         return out
 
 
+TEE_IDLE_BLOCKS = ({'name': 'A1-idle-on', 'deep_idle': True, 'seconds': 600},
+                   {'name': 'B-idle-off', 'deep_idle': False, 'seconds': 600},
+                   {'name': 'A2-idle-on', 'deep_idle': True, 'seconds': 600})
+TEE_MARK = re.compile(r'STAB TEE_IDLE (\S+) (start|end)\b')
+HOST_STAMP = re.compile(r'^\d\d:\d\d:\d\d\.\d{3} ')
+CALLER = re.compile(r'^\[\s*\d+(?:\.\d+)?\]\[\s*([^\]]*?)\s*\]')
+CPUIDLE = '/sys/devices/system/cpu/cpu*/cpuidle/state*/disable'
+
+
+def caller(body):
+    """The caller field after the kernel time ('[  323.317830][T563@C0] ...' -> 'T563@C0'), else None."""
+    m = CALLER.match(body)
+    return m.group(1) if m else None
+
+
+def trusty_reports(lines, look=60):
+    """Trusty IRQ-off reports among kernel lines: irqsoff_warn reports (vendor debug print 'irqsoff_warn: C<cpu>
+    T:<pid><comm> D:<ms>ms F:<s>s', then the stacks where IRQs were disabled and enabled again) whose stack holds
+    trusty_std_call_helper (a TEE standard call that kept the CPU's IRQs off). Two formats: the device's dmesg (stack
+    lines carry no time stamp and belong to the stamped line above them; only that CPU's 'disabled/enabled IRQ at:'
+    records count) and a serial capture (host time, then kernel time and caller on every line, other CPUs' lines in
+    between: only the report's caller counts). The stack is looked for in the next `look` lines, up to that CPU's
+    (caller's) next report. [{'i': index of the report line, 'cpu', 'comm', 'ms', 'f', 'site'}]; site: the
+    trusty_std_call32 offset in the stack ('+0xe4'), '?' when there is none."""
+    body = [HOST_STAMP.sub('', l.rstrip('\r'), count=1) for l in lines]
+    out = []
+    for i, b in enumerate(body):
+        o = parse_off(b)
+        if not o or o[0] != 'irqsoff':
+            continue
+        cpu, tag = o[1], caller(b)
+        own = re.compile(rf'irqsoff_warn: C{cpu} (?:disabled|enabled) IRQ at:')
+        rec, mine = [], False
+        for b2 in body[i + 1:i + 1 + look]:
+            if ktime(b2) is not None:  # a stamped line starts a record: the report's own, or another one
+                o2 = parse_off(b2)
+                same = caller(b2) == tag if tag is not None else bool(own.search(b2) or (o2 and o2[1] == cpu))
+                if same and o2:  # this CPU's next report
+                    break
+                mine = same
+            if mine:
+                rec.append(b2)
+                if len(rec) >= 16:
+                    break
+        text = ' '.join(rec)
+        if 'trusty_std_call_helper' in text:
+            m = re.search(r'trusty_std_call32\+(0x[0-9a-f]+)', text)
+            out.append({'i': i, 'cpu': cpu, 'comm': o[2], 'ms': o[3], 'f': o[4], 'site': '+' + m.group(1) if m else '?'})
+    return out
+
+
+def tee_block(lines, name):
+    """Trusty IRQ-off reports of block `name`: those whose report line lies after the last 'STAB TEE_IDLE <name> start'
+    marker and before its end marker (or the end of the lines); the stack is read across the end marker (other CPUs'
+    lines, the marker among them, can come between a report and its stack on a serial console). None without a start
+    marker (no copy of the kernel log for this block)."""
+    s = None
+    for i, l in enumerate(lines):
+        m = TEE_MARK.search(l)
+        if m and m.group(1) == name and m.group(2) == 'start':
+            s = i
+    if s is None:
+        return None
+    e = len(lines)
+    for j in range(s + 1, len(lines)):
+        m = TEE_MARK.search(lines[j])
+        if m and m.group(1) == name and m.group(2) == 'end':
+            e = j
+            break
+    return [r for r in trusty_reports(lines[s:]) if r['i'] < e - s]
+
+
+def tee_stats(reports, thr):
+    """Counts of a block's Trusty IRQ-off reports: all, >= thr ms, >= 100 ms; the five longest; call sites of those
+    >= thr ms."""
+    ds = sorted((r['ms'] for r in reports), reverse=True)
+    return {'reports': len(ds), 'ge_thr': sum(d >= thr for d in ds), 'ge100': sum(d >= 100 for d in ds),
+            'longest': ds[:5], 'sites': dict(collections.Counter(r['site'] for r in reports if r['ms'] >= thr))}
+
+
+def tee_best(b):
+    """The copy of a tee_idle block's counts (device log or serial) with the most reports at or above the threshold
+    (the device's on a tie), or None when neither has the block's markers."""
+    return max((s for s in (b['device'], b['serial']) if s), key=lambda s: s['ge_thr'], default=None)
+
+
+def stop_cmd(pids, pattern):
+    """Shell command that stops each process of `pids` (shell words, e.g. $(cat <pid file>)) with its children, but only
+    while its command line still matches the extended regex `pattern`: after a reboot a pid from a file or from an
+    earlier call can belong to any process."""
+    return (f'for p in {pids}; do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | grep -qE {shlex.quote(pattern)} && '
+            '{ pkill -P $p; kill $p; }; done')
+
+
+def tee_idle_lines(out):
+    """The TEE idle table of summary.md (tee-idle.json written by phase tee_idle), or none."""
+    try:
+        with open(os.path.join(out, 'tee-idle.json')) as f:
+            t = json.load(f)
+    except (OSError, ValueError):
+        return []
+    thr = f"{t['threshold_ms']:g}"
+    cnt = lambda s: f"{s['ge_thr']} ({s['ge100']})" if s else 'n/a'
+    L = ['', f'## TEE idle: Trusty IRQ-off reports >= {thr} ms (>= 100 ms)', '',
+         '| block | deep idle | s | TEE ops / failures | device log | serial | longest (ms) | call sites |',
+         '|---|---|---|---|---|---|---|---|']
+    for b in t['blocks']:
+        best = tee_best(b) or {}
+        L.append(f"| {b['name']} | {'on' if b['deep_idle'] else 'off'} | {b['seconds']} | {b['ops']} / {b['failures']} | "
+                 f"{cnt(b['device'])} | {cnt(b['serial'])} | {', '.join(f'{d:.0f}' for d in best.get('longest', [])) or '-'} | "
+                 f"{', '.join(f'{k} x{v}' for k, v in best.get('sites', {}).items()) or '-'} |")
+    return L
+
+
 def step_names(steps):
     """Phase name of each el2_stress step: a repeated step is <step>-r2, -r3, ... (the first keeps the plain name)."""
     n, out = collections.Counter(), []
@@ -966,7 +1080,7 @@ class Run:
         if not self.dev.alive():
             raise Abort(f'device {self.dev.serial} not reachable')
         self.dev.su(f'mkdir -p {DEV}/tmp && chmod 777 {DEV} {DEV}/tmp')
-        files = [os.path.join(REPO, 'device', f) for f in ('health.sh', 'el2stress.sh', 'rundown.sh')]
+        files = [os.path.join(REPO, 'device', f) for f in ('health.sh', 'el2stress.sh', 'rundown.sh', 'klogwatch.sh')]
         tdir = os.path.join(REPO, 'third_party', 'out', 'aarch64')
         for t in ('stress-ng', 'stressapptest', 'cyclictest', 'hackbench'):
             if os.path.exists(os.path.join(tdir, t)):
@@ -1733,6 +1847,136 @@ class Run:
             if stage in ('before', 'away', 'back'):
                 self.rundown_abandon(stage, orig, pkg, path)
 
+    # ------------------------------------------------------------------ TEE idle
+    def cpuidle_states(self):
+        """{disable file of every CPU's idle state 1 and above (the deep ones; state 0 is WFI): its value}."""
+        _, out = self.dev.su(f'for f in {CPUIDLE}; do [ -e "$f" ] && echo "$f=$(cat $f)"; done', timeout=60)
+        st = {}
+        for line in (out or '').splitlines():
+            m = re.fullmatch(r'(/sys/\S+/cpuidle/state(\d+)/disable)=(\d+)', line.strip())
+            if m and int(m.group(2)) >= 1:
+                st[m.group(1)] = m.group(3)
+        return st
+
+    def cpuidle_write(self, values):
+        """Writes {disable file: value}; returns the files that do not read back their value."""
+        self.dev.su('; '.join(f'echo {v} > {f}' for f, v in values.items()), timeout=60)
+        now = self.cpuidle_states()
+        return [f for f, v in values.items() if now.get(f) != str(v)]
+
+    def kmsg(self, text):
+        self.dev.su(f'echo {shlex.quote(text)} > /dev/kmsg', timeout=30)
+
+    def tee_idle_block(self, b, out, klog, soff, thr):
+        """Result of one tee_idle block (its load's output `out`): TEE ops and failures, and the Trusty IRQ-off
+        reports between the block's markers in the device's copy of the kernel log and, with a capture, on the serial
+        console; an INFO event, and TEE_IRQSOFF when any of them reached thr ms."""
+        r = {'name': b['name'], 'deep_idle': b['deep'], 'seconds': b['seconds'], 'ops': None, 'failures': None,
+             'trusty_irq': None, 'device': None, 'serial': None}
+        m = re.search(r'ops=(\d+) failures=(\d+) trusty_irq=(-?\d+)', out or '')
+        if m:
+            r.update(ops=int(m.group(1)), failures=int(m.group(2)), trusty_irq=int(m.group(3)))
+        _, k = self.dev.su(f'cat {klog}', timeout=120)
+        rep = tee_block((k or '').splitlines(), self.phase)
+        r['device'] = tee_stats(rep, thr) if rep is not None else None
+        if self.serial and os.path.exists(self.serial):
+            with open(self.serial, 'rb') as f:
+                f.seek(soff)
+                lines = f.read().decode('utf-8', 'replace').splitlines()
+            rep = tee_block(lines, self.phase)
+            r['serial'] = tee_stats(rep, thr) if rep is not None else None
+        fmt = lambda s: (f"{s['ge_thr']} (>= 100 ms: {s['ge100']}; longest {s['longest']} ms; sites {s['sites']})"
+                         if s else 'n/a (no block markers in this copy)')
+        idle = 'on' if b['deep'] else 'off'
+        self.event('INFO', f"{b['name']}: deep idle {idle}; TEE ops {r['ops']}, failures {r['failures']}, Trusty "
+                   f"interrupts {r['trusty_irq']}; Trusty IRQ-off reports >= {thr:g} ms: device log {fmt(r['device'])}"
+                   + (f"; serial {fmt(r['serial'])}" if self.serial else ''))
+        if r['device'] is None and r['serial'] is None:
+            self.event('SKIP', f"{b['name']}: the block's markers are in no copy of the kernel log (device/klogwatch.sh "
+                       'not running, no serial capture): nothing counted')
+        s = tee_best(r)
+        if s and s['ge_thr']:
+            self.event('TEE_IRQSOFF', f"{b['name']}: {s['ge_thr']} Trusty IRQ-off reports >= {thr:g} ms with deep idle {idle} "
+                       f"(longest {s['longest']} ms, call sites {s['sites']})")
+        return r
+
+    def phase_tee_idle(self, p):
+        """The TEE load of el2stress.sh's tee step without cyclictest, in blocks with the CPUs' deep idle states on or off
+        (default: on, off, on again, 600 s each): a Trusty call that kept the Host's IRQs off for hundreds of ms showed
+        up only while CPUs used deep idle (T11206, 2026-10-14: 6 / 0 / 1 reports >= 30 ms before the fix, 0 / 0 / 0
+        after). Each block is bracketed by 'STAB TEE_IDLE <block> start|end' kernel-log markers; a detached `dmesg -w`
+        follower on the device (klogwatch.sh) keeps the IRQ-off reports and markers, so no serial capture is needed;
+        with one, its count is reported too, as a cross-check. The original deep idle settings are restored at the end
+        and on any abort or Ctrl-C (RESTORE_FAIL when they do not read back); the load and the follower are stopped only
+        while their pids still run them (stop_cmd). Results in tee-idle.json and a table in summary.md."""
+        blocks = p.get('blocks', TEE_IDLE_BLOCKS)
+        w, thr, base = int(p.get('workers', 2)), float(p.get('threshold_ms', 30)), self.phase
+        orig = self.cpuidle_states()
+        if not orig:
+            self.event('SKIP', 'tee_idle: no cpuidle states 1 and above on this device')
+            return
+        self.save('tee-idle-cpuidle.txt', ''.join(f'{f}={v}\n' for f, v in orig.items()))
+        klog = f'{DEV}/tmp/tee-idle-klog.txt'
+        watch = stop_cmd(f'$(cat {klog}.pid 2>/dev/null)', 'klogwatch|awk') + f'; rm -f {klog}.pid'
+        results, pid = [], None
+        try:
+            # a follower left by an earlier run that was killed is stopped first
+            self.dev.su(f'{watch}; rm -f {klog}; setsid nohup sh {DEV}/klogwatch.sh {klog} '
+                        '"irqsoff_warn|STAB TEE_IDLE" > /dev/null 2>&1 < /dev/null &', timeout=30)
+            for b in blocks:
+                b = {'name': b['name'], 'deep': bool(b.get('deep_idle', True)), 'seconds': int(b.get('seconds', 600))}
+                self.phase = f"{base}/{b['name']}"
+                self.event('PHASE_START', f"{b['name']}: deep idle {'on' if b['deep'] else 'off'}, {b['seconds']} s, "
+                           f'{w} TEE workers')
+                self.mark_phase()
+                miss = self.cpuidle_write({f: 0 if b['deep'] else 1 for f in orig})
+                if miss:
+                    self.event('INFO', f"{b['name']}: {len(miss)} of {len(orig)} deep idle states kept another value: "
+                               + ' '.join(miss)[:200])
+                soff = os.path.getsize(self.serial) if self.serial and os.path.exists(self.serial) else 0
+                self.kmsg(f'STAB TEE_IDLE {self.phase} start')
+                log = f"{DEV}/tmp/tee-idle-{b['name']}.log"
+                _, out = self.dev.su(f"TEE_CYCLIC=0 TEE_WORKERS={w} nohup sh {DEV}/el2stress.sh tee {b['seconds']} "
+                                     f'> {log} 2>&1 & echo "TEEPID $!"', timeout=30)
+                m = re.search(r'TEEPID (\d+)', out or '')
+                pid = m.group(1) if m else None
+                self.wait(b['seconds'], b['name'])
+                out, end = '', time.time() + 300
+                while time.time() < end:
+                    _, out = self.dev.su(f'cat {log}', timeout=30)
+                    if 'EL2STRESS_DONE tee' in (out or ''):
+                        pid = None
+                        break
+                    self.checkpoint(b['name'])
+                    time.sleep(10)
+                self.kmsg(f'STAB TEE_IDLE {self.phase} end')
+                time.sleep(3)  # the end marker and the last reports into the device's copy and the capture
+                self.save(f"tee-idle-{b['name']}.txt", out or '')
+                if 'EL2STRESS_DONE tee' not in (out or ''):
+                    self.event('STRESS_FAIL', f"{b['name']}: no EL2STRESS_DONE within {b['seconds'] + 300} s")
+                    if pid:  # not into the next block
+                        self.dev.su(stop_cmd(pid, 'el2stress'), timeout=30)
+                        pid = None
+                for line in (out or '').splitlines():
+                    if line.startswith('EL2STRESS ') and ' rc=' in line and not re.search(r' rc=0\b', line):
+                        self.event('STRESS_FAIL', f"{b['name']}: {line[:200]}")
+                results.append(self.tee_idle_block(b, out, klog, soff, thr))
+                self.event('PHASE_END', b['name'])
+        finally:
+            if pid:  # interrupted: the load's workers stop with their script
+                self.dev.su(stop_cmd(pid, 'el2stress'), timeout=30)
+            self.dev.su(watch, timeout=30)
+            miss = self.cpuidle_write(orig)
+            if miss:
+                self.event('RESTORE_FAIL', f'tee_idle: {len(miss)} of {len(orig)} deep idle states not restored (a '
+                           'reboot puts them back to the defaults): ' + ' '.join(miss)[:200]
+                           + '; original values in tee-idle-cpuidle.txt')
+            else:
+                self.event('INFO', f'tee_idle: deep idle settings restored ({len(orig)} states)')
+            self.phase = base
+            self.save('tee-idle.json', json.dumps({'threshold_ms': thr, 'workers': w, 'blocks': results}, indent=1) + '\n')
+        self.mark_phase()  # back in the outer phase: later kernel lines are not the last block's
+
     # ------------------------------------------------------------------ driver
     def execute(self, expect_sha):
         self.save('plan.json', json.dumps(self.plan, indent=2, ensure_ascii=False))
@@ -1810,6 +2054,7 @@ def write_summary(out):
         kinds[e['kind']] += e.get('count', 1)
     for k, n in sorted(kinds.items()):
         L.append(f'| {k} | {n} |')
+    L += tee_idle_lines(out)
     L += ['', '## Phases', ''] + [f"- {e['t']} {e['phase']} {e['kind']} {e['msg'][:160]}" for e in phases]
     L += ['', '## Errors', ''] + [f"- {e['t']} {e['phase']} {e['kind']}: {e['msg']}" for e in errors]
     L += ['', '## Warnings (first 20 events of each kind)', '']

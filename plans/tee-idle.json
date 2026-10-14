@@ -1,0 +1,17 @@
+{
+  "name": "tee idle: Trusty IRQ-off windows under the TEE load (2 workers, no cyclictest) with deep idle on, off, on again, 600 s each (about 35 minutes); no EL2 monitor (its sampling IPIs keep CPUs out of deep idle); run the same on stock",
+  "health_interval_s": 300,
+  "lost_timeout_s": 600,
+  "phases": [
+    {
+      "type": "tee_idle",
+      "workers": 2,
+      "threshold_ms": 30,
+      "blocks": [
+        {"name": "A1-idle-on", "deep_idle": true, "seconds": 600},
+        {"name": "B-idle-off", "deep_idle": false, "seconds": 600},
+        {"name": "A2-idle-on", "deep_idle": true, "seconds": 600}
+      ]
+    }
+  ]
+}

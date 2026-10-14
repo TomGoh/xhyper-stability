@@ -24,7 +24,9 @@
 #   tee       TEE calls: parallel workers generate an RSA key in the TEE (KeyMint in Trusty), sign and verify with it
 #             five times, delete it, again; each call is an SMC the hypervisor forwards and a Trusty notification on
 #             SGI 13 (which XHyper hooks); every verify must say OK; keys are named stab_tee_* and all removed at the end
-#             (TEE encrypt/decrypt with keystore_cli_v2 failed on decrypt on 2026-10-13: not used until compared on stock)
+#             (TEE encrypt/decrypt with keystore_cli_v2 failed on decrypt on 2026-10-13: not used until compared on stock);
+#             TEE_WORKERS workers (default 2); cyclictest alongside unless TEE_CYCLIC=0 (phase tee_idle: its 1 ms timers
+#             keep every CPU out of deep idle, where the Trusty IRQ-off windows it looks for showed up)
 #   all       ipi + timer + idle + affinity (with traffic) + hotplug + copy + gpu at once (not tee: TEE key generation
 #             holds a CPU in the secure world for about 0.9 s per call, which together with everything else starved
 #             system_server's watchdog for 16 s on 2026-10-13)
@@ -157,7 +159,7 @@ tee() {
   # cyclictest alongside: how long CPUs stay out of Linux's reach while a TEE call runs (an interrupt that arrives
   # while the CPU is in the secure world should make Trusty yield quickly; a TEE call that cannot be interrupted shows
   # up here as a latency of up to the length of the call, about 0.9 s for an RSA key generation on T11206)
-  [ -x $D/cyclictest ] && $D/cyclictest -m -p 90 -i 1000 -t -a -q -D ${T}s > $TMP/tee-cyclic.log 2>&1 &
+  [ "${TEE_CYCLIC:-1}" != 0 ] && [ -x $D/cyclictest ] && $D/cyclictest -m -p 90 -i 1000 -t -a -q -D ${T}s > $TMP/tee-cyclic.log 2>&1 &
   a=$(trusty); end=$(( $(date +%s) + T )); W=${TEE_WORKERS:-2}
   w=0; while [ $w -lt $W ]; do
     ( n=0; ops=0; bad=0
@@ -177,7 +179,8 @@ tee() {
   for k in $(keystore_cli_v2 list --prefix=stab_tee 2>/dev/null | grep stab_tee); do keystore_cli_v2 delete --name=$k > /dev/null 2>&1; done
   b=$(trusty); wait
   cmax=$(grep -oE 'Max: *[0-9]+' $TMP/tee-cyclic.log 2>/dev/null | awk '{printf "%s%s", sep, $2; sep=","}')
-  echo "EL2STRESS $S tee workers=$W ops=$ops failures=$bad trusty_irq=$((b - a)) cyclictest_max_us=[$cmax] rc=$([ $bad = 0 ] && echo 0 || echo 1)"
+  cyc="cyclictest_max_us=[$cmax]"; [ "${TEE_CYCLIC:-1}" = 0 ] && cyc=cyclictest=off
+  echo "EL2STRESS $S tee workers=$W ops=$ops failures=$bad trusty_irq=$((b - a)) $cyc rc=$([ $bad = 0 ] && echo 0 || echo 1)"
 }
 all() { export LIGHT=1; ipi & timer & idle & affinity & hotplug & copy & gpu & wait; }
 
