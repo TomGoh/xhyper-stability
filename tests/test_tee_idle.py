@@ -117,9 +117,41 @@ class Best(unittest.TestCase):
             self.assertIn('| A1 | on | 600 | 9 / 0 | 0 (0) | 2 (1) | 140, 40 | +0xe4 x2 |', stab.tee_idle_lines(d))
 
     def test_stop_command(self):
+        """The command lines are all read (cat, then tr on the pipe) before the first process is stopped."""
         self.assertEqual(stab.stop_cmd('$(cat /x.pid 2>/dev/null)', 'klogwatch|awk'),
-                         'for p in $(cat /x.pid 2>/dev/null); do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | '
-                         "grep -qE 'klogwatch|awk' && { pkill -P $p; kill $p; }; done")
+                         'stop=; for p in $(cat /x.pid 2>/dev/null); do cat /proc/$p/cmdline 2>/dev/null | '
+                         'tr "\\0" " " | grep -qE \'klogwatch|awk\' && stop="$stop $p"; done; '
+                         'for p in $stop; do pkill -P $p; kill $p; done')
+
+    @unittest.skipUnless(os.path.exists('/proc/self/cmdline') and shutil.which('pkill'), 'needs /proc and pkill')
+    def test_stop_command_parent_then_child(self):
+        """Pids of a parent and then its own child (as klogwatch.sh's pid file lists the script and its awk), plus one
+        that does not match: the command ends, parent and child are gone, the other process still runs. (The 100 % CPU
+        loop it prevents was toybox tr on the tablet; this host test checks the stop logic, not toybox.)"""
+        with tempfile.TemporaryDirectory() as d:
+            mark = os.path.join(d, 'child')
+            par = subprocess.Popen(['sh', '-c', 'sleep 300 & echo $! > "$0"; wait', mark])
+            other = subprocess.Popen(['sleep', '301'])
+            try:
+                for _ in range(50):
+                    if os.path.exists(mark) and open(mark).read().strip():
+                        break
+                    time.sleep(0.1)
+                child = int(open(mark).read())
+                subprocess.run(['sh', '-c', stab.stop_cmd(f'{par.pid} {child} {other.pid}', 'sleep 300')],
+                               timeout=10, check=False)
+                par.wait(timeout=5)
+                for _ in range(50):
+                    if not os.path.exists(f'/proc/{child}'):
+                        break
+                    time.sleep(0.1)
+                self.assertFalse(os.path.exists(f'/proc/{child}'))
+                self.assertIsNone(other.poll())
+            finally:
+                for q in (par, other):
+                    if q.poll() is None:
+                        q.kill()
+                        q.wait()
 
 
 # ==== Blocks ==========================================================================================================
@@ -242,16 +274,18 @@ class TeeTablet:
         return 'running' if self.watch_pids and self.watch_pids[0] in self.procs else 'stopped'
 
     def stop(self, cmd):
-        """stab.stop_cmd: the processes of its pid list whose command line matches its pattern (and their children)."""
-        m = re.match(r"for p in (.+?); do .*?grep -qE '?([^' ]+?)'? && ", cmd)
+        """stab.stop_cmd: first the processes of its pid list whose command line matches its pattern, then each of
+        them that still runs is stopped with its children (killed lists those)."""
+        m = re.match(r"stop=; for p in (.+?); do .*?grep -qE '?([^' ]+?)'? && stop=", cmd)
         pids = self.watch_pids if m.group(1).startswith('$(cat') else m.group(1).split()
-        for p in pids:
-            if p in self.procs and re.search(m.group(2), self.procs[p]):
+        matching = [p for p in pids if p in self.procs and re.search(m.group(2), self.procs[p])]
+        for p in matching:
+            if p in self.procs:
                 self.killed.append(p)
                 for q in [q for q, c in self.procs.items() if q == p or c.endswith(f'parent={p}')]:
                     del self.procs[q]
-        # the rest of the command line after the stop loop
-        return cmd.split('; done', 1)[1].lstrip('; ')
+        # the rest of the command line after the two loops
+        return cmd.split('kill $p; done', 1)[1].lstrip('; ')
 
     def health(self, marker='', since=None, boot=None):
         """A minimal snapshot of the one boot."""
@@ -274,7 +308,7 @@ class TeeTablet:
             return 0, ''.join(f'{f}={v}\n' for f, v in self.idle.items())
         if 'random/boot_id' in cmd:  # mark_phase
             return 0, BOOT + '\n'
-        if cmd.startswith('for p in '):
+        if cmd.startswith('stop=; for p in '):
             cmd = self.stop(cmd)
         out = []
         for c in cmd.split('; '):

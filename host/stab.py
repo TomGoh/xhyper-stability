@@ -740,9 +740,16 @@ def tee_best(b):
 def stop_cmd(pids, pattern):
     """Shell command that stops each process of `pids` (shell words, e.g. $(cat <pid file>)) with its children, but only
     while its command line still matches the extended regex `pattern`: after a reboot a pid from a file or from an
-    earlier call can belong to any process."""
-    return (f'for p in {pids}; do tr "\\0" " " < /proc/$p/cmdline 2>/dev/null | grep -qE {shlex.quote(pattern)} && '
-            '{ pkill -P $p; kill $p; }; done')
+    earlier call can belong to any process.
+
+    All command lines are read before anything is stopped. klogwatch.sh's pid file lists the script and then its awk,
+    a child of the script: stopping the script's children while the loop went on to read the awk's
+    /proc/<pid>/cmdline made toybox `tr` (redirected from that file) loop at 100 % CPU forever on T11206
+    (2026-10-15, two of them for 40 minutes). `cat` reads the file and stops on a vanished process; `tr` only reads
+    the pipe."""
+    return (f'stop=; for p in {pids}; do cat /proc/$p/cmdline 2>/dev/null | tr "\\0" " " '
+            f'| grep -qE {shlex.quote(pattern)} && stop="$stop $p"; done; '
+            'for p in $stop; do pkill -P $p; kill $p; done')
 
 
 def tee_idle_lines(out):
