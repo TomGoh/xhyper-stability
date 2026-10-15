@@ -15,29 +15,93 @@ they happened in (a `STAB PHASE_START` marker in the kernel log at every phase s
 collected them. Every event goes to events.jsonl and log.txt; summary.md is (re)written at the end, also after Ctrl-C
 or an abort. Python 3 stdlib only.
 """
+# ==== Program structure ===============================================================================================
+# The docstring above is the command-line help (`stab.py --help` prints it); the explanation of the program is here.
+#
+# Classes:
+#   Abort        raised to end a run early (device gone, boot failed, identity mismatch, a phase that cannot start);
+#                Run.execute records it as an ABORT event and still writes the summary.
+#   Device       one Android device over adb: adb / sh / su (root through `su 0`) commands with timeouts, waits for
+#                adb to drop or come back and for the boot to complete, and health(): device/health.sh run as root,
+#                its output parsed by parse_health.
+#   ConsoleHist  bytes the serial console carried per 0.1 s of kernel time; tells whether a long preempt/IRQ-off
+#                report was caused by the synchronous serial console.
+#   RundownLive  follows the battery sampler's 'RUNDOWN <csv line>' kernel-log lines in a serial capture while USB is
+#                unplugged (rundown-live.csv) and reports the progress.
+#   Run          one run of a plan: the phases in order, the health snapshots, the events, the summary.
+#
+# Phases: Run.execute runs setup (device scripts and tools pushed, boot_a checked against --expect-boot-sha, a
+# baseline snapshot, the EL2 parallel log started), then for each entry of the plan's "phases" a PHASE_START event
+# and a 'STAB PHASE_START <phase>' kernel-log marker, Run.phase_<type>(entry), any not-responding dialog dismissed, a
+# snapshot and PHASE_END. Phase types (one method each): reboot_loop, soak, suspend, memtest, standby, latency,
+# el2_stress, monitor_soak, battery_rundown, tee_idle. Phase names are '<n>-<type>'; el2_stress and tee_idle add
+# '/<step or block>'.
+#
+# Health snapshot loop: a phase sleeps through Run.wait(), which calls Run.checkpoint() at least every 15 s; a
+# checkpoint that is due (every `health_interval_s`, default 300) takes a snapshot (Run.snapshot: device/health.sh),
+# scans the serial capture's new bytes for fatal markers and, with the EL2 monitor, pulls and checks the EL2 log.
+# A snapshot is compared with the previous one: boot id (a planned reboot, else UNEXPECTED_REBOOT with pstore and
+# boot reasons), device inventory, new kernel lines (graded by kernel_grade and attributed by kernel time to the
+# phase whose marker precedes them), crash buffer, ANRs, tombstones, pstore records, suspend counters. A snapshot
+# that gets no answer goes to Run.lost() (PROBE_TIMEOUT, DEVICE_LOST, DEVICE_GONE, BOOT_FAIL).
+#
+# Events: Run.event() appends one JSON line to events.jsonl and one line to log.txt and stdout. The kind sets the
+# severity: a kind in ERRORS (or an ABORT) makes the run FAIL, a kind in WARNINGS is a warning, any other kind
+# (INFO, PHASE_START, PHASE_END, EL2_LOAD, ...) is information.
+#
+# Report: write_summary() (re)writes summary.md from events.jsonl at the end of every run (also after an abort or
+# Ctrl-C) and on `stab.py report DIR`; el2_report.py and rundown_report.py write their own reports next to it.
+#
+# Map of this file, in order:
+#   paths and event classes      REPO, DEV, ERRORS, WARNINGS
+#   device access                Abort, Device, parse_health
+#   serial and kernel patterns   SERIAL_FATAL, KERNEL_ERROR
+#   EL2 monitor modules          ko_load_order
+#   kernel log grading           ktime, printout_windows, parse_off, irq_intervals, waits_on, ConsoleHist,
+#                                console_load, kernel_grade
+#   suspend and standby          wake_info, wake_lines, wake_source, standby_summary
+#   battery rundown helpers      lock files, settings to apply / restore, the start checks
+#   battery rundown live view    stamp_time, RundownLive
+#   TEE idle helpers             trusty_reports, tee_block, tee_stats, tee_best, stop_cmd, tee_idle_lines
+#   small helpers                step_names, attribute, num, fnum
+#   the run (class Run)          records, health snapshots, serial console, core loop, EL2 parallel log, setup,
+#                                one section per phase, driver (execute)
+#   report                       count, rundown_lines, write_summary
+#   command line                 main
+
 import argparse, collections, csv, datetime, json, os, re, shlex, signal, statistics, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import el2_report  # noqa: E402
 import rundown_report  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEV = '/data/local/tmp/stab'
-ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL', 'MEMTEST_FAIL', 'SUSPEND_FAIL',
-          'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
-WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH', 'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'STANDBY_SHORT', 'DEVICE_LOST', 'PROBE_TIMEOUT', 'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP', 'MONKEY_CRASH',
-            'MONKEY_ANR', 'BOOT_REASON', 'RUNDOWN_INVALID', 'RESTORE_FAIL', 'TEE_IRQSOFF'}
+# ==== Paths and event classes =========================================================================================
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repository root (device/, third_party/ below)
+DEV = '/data/local/tmp/stab'  # working directory on the device: scripts, tools, logs
+# Event kinds that make a run FAIL (log.txt marks them ERROR)
+ERRORS = {'DEVICE_MISSING', 'SERIAL_FATAL', 'UNEXPECTED_REBOOT', 'DEVICE_GONE', 'BOOT_FAIL', 'STRESS_FAIL',
+          'MEMTEST_FAIL', 'SUSPEND_FAIL', 'KERNEL_BAD', 'IDENTITY_MISMATCH', 'RESUME_TIMEOUT', 'MONITOR_FAIL'}
+# Event kinds that are warnings (log.txt marks them WARN; summary.md lists the first 20 of each kind)
+WARNINGS = {'PC_MODE', 'ANR_DIALOG', 'HV_WAKEUP_AUDIT', 'SERIAL_STALE', 'EL2_LOG_DOWN', 'EL2_MISSING', 'EL2_HIGH',
+            'EL2_COUNT_DOWN', 'KERNEL_WARN', 'SUSPEND_ABORTED', 'STANDBY_SHORT', 'DEVICE_LOST', 'PROBE_TIMEOUT',
+            'KERNEL_LOG_CAPPED', 'HEALTH_DEGRADED', 'CRASH', 'ANR', 'TOMBSTONE', 'SUSPEND_NOT_ENTERED', 'SKIP',
+            'MONKEY_CRASH', 'MONKEY_ANR', 'BOOT_REASON', 'RUNDOWN_INVALID', 'RESTORE_FAIL', 'TEE_IRQSOFF'}
 
 
+# ==== Device access: adb, su and the health snapshot ==================================================================
 class Abort(Exception):
+    """Ends the run early; Run.execute records the message as an ABORT event (the run is FAIL) and writes the
+    summary."""
     pass
 
 
 class Device:
+    """One Android device on adb (by serial number). Every call has a timeout; a timed-out call returns rc None."""
     def __init__(self, serial):
         self.serial = serial
 
     def adb(self, *args, timeout=60):
+        """(exit code, stdout + stderr) of `adb -s <serial> <args>`; (None, 'TIMEOUT') when it did not end in time."""
         try:
             p = subprocess.run(['adb', '-s', self.serial, *args], capture_output=True, text=True,
                                errors='replace', timeout=timeout)
@@ -46,16 +110,20 @@ class Device:
             return None, 'TIMEOUT'
 
     def sh(self, cmd, timeout=60):
+        """`adb shell <cmd>` as the shell user; (exit code, output) as adb()."""
         return self.adb('shell', cmd, timeout=timeout)
 
     def su(self, cmd, timeout=60):  # tablets: `su 0`, never `adb root`
+        """`cmd` run as root through `su 0 sh -c`; (exit code, output) as adb()."""
         return self.sh('su 0 sh -c ' + shlex.quote(cmd), timeout=timeout)
 
     def alive(self):
+        """Whether the device answers a trivial adb shell command within 10 s."""
         rc, _ = self.adb('shell', 'true', timeout=10)
         return rc == 0
 
     def wait_alive(self, timeout):
+        """Polls every 5 s until the device answers on adb; False when it did not within `timeout` seconds."""
         end = time.time() + timeout
         while time.time() < end:
             if self.alive():
@@ -64,6 +132,8 @@ class Device:
         return False
 
     def wait_drop(self, timeout):
+        """Polls every 1 s until the device stops answering on adb (suspend, reboot, unplug); False when it still
+        answers after `timeout` seconds."""
         end = time.time() + timeout
         while time.time() < end:
             if not self.alive():
@@ -72,6 +142,7 @@ class Device:
         return False
 
     def wait_boot(self, timeout):
+        """Polls every 5 s until sys.boot_completed is 1; False when it is not within `timeout` seconds."""
         end = time.time() + timeout
         while time.time() < end:
             rc, out = self.sh('getprop sys.boot_completed', timeout=10)
@@ -82,7 +153,8 @@ class Device:
 
     def health(self, marker='', since=None, boot=None):
         """Parsed snapshot, or None; self.fail then says why: 'timeout' (no answer in 180 s) or the failure.
-        since, boot: the previous snapshot's dmesg_last and boot_id (only newer kernel lines on that boot)."""
+        since, boot: the previous snapshot's dmesg_last and boot_id (only newer kernel lines on that boot).
+        marker: health.sh writes 'STAB <marker>' to the kernel log (it also shows on the serial console)."""
         args = ' '.join(shlex.quote(str(a)) for a in (marker, since or '', boot or ''))
         # 180 s: under the all-at-once EL2 stress a snapshot (dumpsys, logcat) took over 90 s on T11206 (2026-10-13)
         rc, out = self.su(f'sh {DEV}/health.sh {args}', timeout=180)
@@ -94,7 +166,8 @@ class Device:
 
 
 def parse_health(out):
-    """health.sh output -> {key: value, '_raw': out, '_sec': {section: [lines]}}."""
+    """health.sh output -> {key: value, '_raw': out, '_sec': {section: [lines]}}. The key=value lines come first;
+    from the first '--- <name>' line on, every non-empty line belongs to the section named last."""
     h, sec, name = {'_raw': out}, collections.defaultdict(list), None
     for line in out.splitlines():
         if line.startswith('--- '):
@@ -109,24 +182,31 @@ def parse_health(out):
     return h
 
 
+# ==== Serial console and kernel log patterns ==========================================================================
 # Fatal markers on the serial console (Linux console and the hypervisor console share the UART on T11206): the
 # hypervisor's panic handler (core/kruntime/src/lang_items.rs prints 'XHYPER PANIC:' then 'XHYPER_PANIC_HOLD'), the
 # Manager's fatal stop, hypervisor boot errors, a Linux panic, and the boot loader's record of the previous reset.
 SERIAL_FATAL = re.compile(rb'XHYPER PANIC|XHYPER_PANIC_HOLD|MANAGER_FATAL|XHYPER_[A-Z_]*ERROR|Kernel panic|'
                           rb'exception_reboot_reason|exception_panic_reason|wdt fiq')
+# Kernel lines that are KERNEL_BAD by themselves: crashes, lockups, RCU stalls, hung tasks, external aborts
 KERNEL_ERROR = re.compile(r'BUG:|Oops|Unable to handle|soft lockup|hard LOCKUP|rcu.*(stall|self-detected)|'
                           r'blocked for more than|Kernel panic|SError|synchronous external abort|Unhandled')
 
 
+# ==== EL2 monitor modules =============================================================================================
 def ko_load_order(d):
     """Module names of the .ko files in d, ordered by their depends= (a topological sort)."""
-    deps = {}
+    deps = {}  # module name (from the .ko's modinfo name=, else the file name) -> names it depends on
     for f in sorted(os.listdir(d)):
         if f.endswith('.ko'):
             b = open(os.path.join(d, f), 'rb').read()
-            n = re.search(rb'\x00name=([^\x00]+)', b); dp = re.search(rb'\x00depends=([^\x00]*)', b)
-            deps[n.group(1).decode() if n else f[:-3]] = [x for x in (dp.group(1).decode().split(',') if dp else []) if x]
+            n = re.search(rb'\x00name=([^\x00]+)', b)
+            dp = re.search(rb'\x00depends=([^\x00]*)', b)
+            deps[n.group(1).decode() if n else f[:-3]] = [
+                x for x in (dp.group(1).decode().split(',') if dp else []) if x]
     order = []
+
+    # depth first: a module's dependencies (those in d) go before it; `path` breaks a dependency cycle
     def visit(n, path=()):
         if n in order or n in path:
             return
@@ -134,12 +214,15 @@ def ko_load_order(d):
             if m in deps:
                 visit(m, path + (n,))
         order.append(n)
+
     for n in deps:
         visit(n)
     return order
 
 
+# ==== Kernel log grading: preempt/IRQ-off reports, WARN splats, serial console load ===================================
 def ktime(line):
+    """Kernel time in seconds of a dmesg line ('[  323.317830] ...'), else None."""
     m = re.match(r'\[\s*(\d+(?:\.\d+)?)\]', line)
     return float(m.group(1)) if m else None
 
@@ -151,20 +234,25 @@ def printout_windows(lines):
         if re.search(r'WARNING: CPU|BUG:|Oops', l):
             start = ktime(l)
         elif '---[ end trace' in l and start is not None:
-            out.append((start, ktime(l) or start)); start = None
+            out.append((start, ktime(l) or start))
+            start = None
     return out
 
 
+# A vendor preempt/IRQ-off report: kind, CPU, task, D (ms the CPU had preemption / IRQs off), F (start, kernel time)
 OFF_REPORT = re.compile(r'\b(preemptoff|irqsoff)_warn: C(\d+) T:<\d+>(.*?) D:\s*(\d+(?:\.\d+)?)\s*ms'
                         r'(?: F:(\d+(?:\.\d+)?)s)?')
+# Lines that are context, not findings (report continuations, splat ends, resume and wake-pending lines)
 CONTEXT_LINE = re.compile(r'(preemptoff|irqsoff)_warn|---\[ end trace|Resume caused by|Wakeup pending')
+# The wake interrupt's device in a resume line ('Resume caused by IRQ 127, <device>')
 WAKE_IRQ = re.compile(r'Resume caused by (?:misconfigured )?IRQ \d+,? (\S+)')
 SERIAL_BPS = 92160      # bytes per second of the serial console: 921600 baud 8N1 (T11206)
 CONSOLE_SHARE = 0.5     # bytes stamped in [F - CONSOLE_LEAD, F + D] >= this share of what the line carries in D
-CONSOLE_LEAD = 0.2
+CONSOLE_LEAD = 0.2      # s before F that count too: the console window is [F - CONSOLE_LEAD, F + D]
 KERNEL_CAP = 2000       # health.sh KCAP: newest kernel lines per snapshot
 GROUP_FIRST = 3         # preempt/IRQ-off reports written one by one per (phase, group); the rest are counted
 REASON_CLASS = {'console-bound:': 'console', 'waits': 'wait', 'inside': 'splat'}  # first word of kernel_grade's why
+# Device suspend/resume steps of the kernel's suspend statistics (health.sh suspend_failed_<step> counters)
 DEVICE_STEPS = ('prepare', 'suspend', 'suspend_late', 'suspend_noirq', 'resume_noirq', 'resume_early', 'resume')
 
 
@@ -205,13 +293,17 @@ class ConsoleHist:
     KT = re.compile(rb'\[\s*([0-9]+\.[0-9]+)\]')
 
     def __init__(self):
+        # bins: {0.1 s bin index: bytes}; part: the unfinished last line; top: newest kernel time seen; cur: kernel
+        # time of the current line; pruned: `top` at the last pruning (pruned once top moved 60 s on)
         self.bins, self.part, self.top, self.cur, self.pruned = {}, b'', None, None, None
 
     def feed(self, chunk):
+        """Counts the bytes of the complete lines in `chunk` (plus the part kept from the previous feed)."""
         lines = (self.part + chunk).split(b'\n')
         self.part = lines.pop()
         if len(self.part) > self.PART_MAX:  # no line end in sight: count it as a line
-            lines.append(self.part); self.part = b''
+            lines.append(self.part)
+            self.part = b''
         for l in lines:
             h = self.HOST.match(l)
             body = l[h.end():] if h else l
@@ -281,6 +373,7 @@ def kernel_grade(line, long_ms=100.0, windows=(), irqs=(), hist=None):
     return 'KERNEL_WARN', ''
 
 
+# ==== Suspend and standby: wake sources ===============================================================================
 def wake_info(lines, since=None):
     """(abort device, wake device) from the kernel's resume/abort lines in log order (wake_lines): abort device = from
     the first 'Resume caused by [misconfigured ]IRQ <n>[,] <device>' after a 'Wakeup pending' line (the wake interrupt
@@ -332,12 +425,13 @@ def standby_summary(cycles, suspend_s):
             + '; wake reasons ' + (', '.join(f'{w} x{n}' for w, n in why.most_common()) or '-'))
     if med is None or med >= suspend_s / 2:
         return info, None
-    return info, (f'woke after a median {med:.0f} s of the requested {suspend_s} s ({why.most_common(1)[0][0]}): long '
-                  'standby not measured; with USB power connected the charger driver arms a wake timer of a few seconds '
-                  'on every suspend')
+    return info, (f'woke after a median {med:.0f} s of the requested {suspend_s} s ({why.most_common(1)[0][0]}): '
+                  'long standby not measured; with USB power connected the charger driver arms a wake timer of a few '
+                  'seconds on every suspend')
 
 
-RUNDOWN = f'{DEV}/rundown'
+# ==== Battery rundown helpers: lock files, settings, start checks =====================================================
+RUNDOWN = f'{DEV}/rundown'  # device directory of the rundown sampler's files (rundown-<time>.csv, rundown.pid)
 # the battery's power supply directory into $B: the one named battery, else the first of type Battery
 BATTERY_DIR = ('B=/sys/class/power_supply/battery; [ -d $B ] || '
                'B=$(dirname "$(grep -lx Battery /sys/class/power_supply/*/type 2>/dev/null | head -1)")')
@@ -345,6 +439,7 @@ BATTERY_DIR = ('B=/sys/class/power_supply/battery; [ -d $B ] || '
 RUNDOWN_SETTINGS = ('system screen_brightness_mode', 'system screen_brightness', 'system peak_refresh_rate',
                     'system min_refresh_rate', 'system accelerometer_rotation', 'system user_rotation',
                     'global airplane_mode_on', 'global wifi_on', 'global bluetooth_on')
+# what the operator must do once per player install (part of the message when playback is not PLAYING)
 VLC_PREP = ('the player needs its one-time preparation on this device (README, battery_rundown): open a video in VLC '
             'once, close the video player introduction, set repeat to "repeat one" in the player menu')
 
@@ -361,6 +456,7 @@ def lock_entries(name, fields):
 
 
 def sha256_file(path):
+    """Hex sha256 of a host file, read in 1 MiB pieces."""
     import hashlib
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -391,16 +487,20 @@ def rundown_apply_cmds(p):
               'cmd bluetooth_manager disable'] if p['airplane'] else [])
     # Match content frame rate off (Android's default 1 lets a 60 fps video pull the panel to 60 Hz although
     # min = peak = 90; seen on T11206, 2026-10-14). Not kept across a reboot.
-    return radio + ['settings put system screen_brightness_mode 0', f"settings put system screen_brightness {p['brightness']}",
-                    f'settings put system peak_refresh_rate {hz:.1f}', f'settings put system min_refresh_rate {hz:.1f}',
-                    'cmd display set-match-content-frame-rate-pref 0', 'settings put system accelerometer_rotation 0',
-                    'settings put system user_rotation 0', f"cmd media_session volume --stream 3 --set {p['volume']}"]
+    return radio + ['settings put system screen_brightness_mode 0',
+                    f"settings put system screen_brightness {p['brightness']}",
+                    f'settings put system peak_refresh_rate {hz:.1f}',
+                    f'settings put system min_refresh_rate {hz:.1f}',
+                    'cmd display set-match-content-frame-rate-pref 0',
+                    'settings put system accelerometer_rotation 0',
+                    'settings put system user_rotation 0',
+                    f"cmd media_session volume --stream 3 --set {p['volume']}"]
 
 
 def radio_on(key, value):
-    """Whether a radio setting's value means the radio is on now; None when the value was not read. global wifi_on: 1 on,
-    2 on in airplane mode, 3 off by airplane mode (remembered as on for its end), 0 off; global bluetooth_on: 1 on,
-    2 off by airplane mode, 0 off; global airplane_mode_on: 1 on."""
+    """Whether a radio setting's value means the radio is on now; None when the value was not read.
+    global wifi_on: 1 on, 2 on in airplane mode, 3 off by airplane mode (remembered as on for its end), 0 off;
+    global bluetooth_on: 1 on, 2 off by airplane mode, 0 off; global airplane_mode_on: 1 on."""
     if value in (None, '', 'null'):
         return None
     return value in ('1', '2') if key == 'global wifi_on' else value == '1'
@@ -415,7 +515,8 @@ def rundown_restore_cmds(orig):
     """Shell commands that bring back the settings read before the rundown (orig: rundown_read_settings); radios
     through their commands by their on/off state (radio_on; the airplane mode first, then 2 s for it to settle),
     'null' settings deleted, values not read left alone."""
-    air, wifi, bt = (radio_on(k, orig.get(k)) for k in ('global airplane_mode_on', 'global wifi_on', 'global bluetooth_on'))
+    air, wifi, bt = (radio_on(k, orig.get(k))
+                     for k in ('global airplane_mode_on', 'global wifi_on', 'global bluetooth_on'))
     cmds = []
     if air is not None:
         cmds += ['cmd connectivity airplane-mode ' + ('enable' if air else 'disable'), 'sleep 2']
@@ -446,11 +547,14 @@ def rundown_checks(st, p, pkg):
     if pkg not in st.get('focus', ''):
         bad.append(f"{pkg} not in focus ({st.get('focus', '').strip()[:120]})")
     if not st.get('hw', (False,))[0]:
-        bad.append(f'no hw-video-codec resource for {pkg} (pid {st.get("pid") or "-"}) in dumpsys media.resource_manager')
+        bad.append(f'no hw-video-codec resource for {pkg} (pid {st.get("pid") or "-"}) '
+                   'in dumpsys media.resource_manager')
     if st.get('backlight') != str(p['brightness']):
         bad.append(f"backlight raw value {st.get('backlight')!r}, not {p['brightness']}")
     vs = st.get('vsync', [])
-    if not vs or any(not re.fullmatch(r'\d+(\.\d+)?', v) or abs(float(v) - float(p['refresh_hz'])) > 0.5 for v in vs):
+    # every one of the three refresh rate reads must be a number within 0.5 Hz of the plan's
+    if not vs or any(not re.fullmatch(r'\d+(\.\d+)?', v) or abs(float(v) - float(p['refresh_hz'])) > 0.5
+                     for v in vs):
         bad.append(f"refresh rate {vs}, not {p['refresh_hz']} Hz")
     if p['airplane']:
         if st.get('airplane') != '1':
@@ -466,6 +570,7 @@ def rundown_checks(st, p, pkg):
     return bad
 
 
+# ==== Battery rundown live view: the sampler's lines on the serial console ============================================
 def stamp_time(stamp, now):
     """Epoch of a capture's 'HH:MM:SS.mmm' stamp on the host's date at `now` (the day before when that would be
     later than now: a line from before midnight)."""
@@ -483,15 +588,22 @@ class RundownLive:
     LINE = re.compile(r'^(\d\d:\d\d:\d\d\.\d{3}) .*?RUNDOWN (.*?)\s*$')
 
     def __init__(self, path, header, sample_s=60):
+        # path: the live file (rundown-live.csv); cols: the sampler's column names (its header line); quiet: seconds
+        # without a sample after which the device counts as shut down
         self.path, self.cols, self.quiet = path, header, max(300, 5 * sample_s)
+        # part: the unfinished last line; n: samples received; bad: RUNDOWN lines that did not parse
         self.part, self.n, self.bad = b'', 0, 0
+        # seen_t: host time the last sample arrived; last: that sample as {column: value}
         self.seen_t = self.start = self.last = None  # start: device epoch of the first sample on battery
+        # next_level: capacity (%) at which the next progress message is due; off: shutdown reported (until a sample)
         self.next_level, self.off = 90, False
         if not os.path.exists(path):
             with open(path, 'w') as f:
                 f.write(','.join(['host_time'] + header) + '\n')
 
     def feed(self, chunk, now):
+        """Takes the next bytes of the capture (`now`: host epoch); appends the samples to the live file and returns
+        the INFO messages due (an empty chunk only runs the quiet check)."""
         lines = (self.part + chunk).split(b'\n')
         self.part = lines.pop()
         out = []
@@ -506,7 +618,8 @@ class RundownLive:
             r = dict(zip(self.cols, vals))
             ht = stamp_time(m.group(1), now)
             with open(self.path, 'a') as f:
-                f.write(datetime.datetime.fromtimestamp(ht).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ',' + m.group(2) + '\n')
+                f.write(datetime.datetime.fromtimestamp(ht).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + ','
+                        + m.group(2) + '\n')
             self.n, self.seen_t, self.last = self.n + 1, now, r
             if self.off:
                 self.off = False
@@ -531,12 +644,18 @@ class RundownLive:
         return out
 
 
+# ==== TEE idle helpers: Trusty IRQ-off reports between block markers ==================================================
+# the blocks of phase tee_idle when the plan gives none: deep idle on, off, on again, 600 s each
 TEE_IDLE_BLOCKS = ({'name': 'A1-idle-on', 'deep_idle': True, 'seconds': 600},
                    {'name': 'B-idle-off', 'deep_idle': False, 'seconds': 600},
                    {'name': 'A2-idle-on', 'deep_idle': True, 'seconds': 600})
+# a block's kernel-log marker, written by the phase: 'STAB TEE_IDLE <phase>/<block> start|end'
 TEE_MARK = re.compile(r'STAB TEE_IDLE (\S+) (start|end)\b')
+# the host's time stamp at the start of a serial capture line
 HOST_STAMP = re.compile(r'^\d\d:\d\d:\d\d\.\d{3} ')
+# kernel time then caller ('[  323.317830][T563@C0]') at the start of a line
 CALLER = re.compile(r'^\[\s*\d+(?:\.\d+)?\]\[\s*([^\]]*?)\s*\]')
+# every CPU's idle states' disable files (1: the state is not used)
 CPUIDLE = '/sys/devices/system/cpu/cpu*/cpuidle/state*/disable'
 
 
@@ -578,7 +697,8 @@ def trusty_reports(lines, look=60):
         text = ' '.join(rec)
         if 'trusty_std_call_helper' in text:
             m = re.search(r'trusty_std_call32\+(0x[0-9a-f]+)', text)
-            out.append({'i': i, 'cpu': cpu, 'comm': o[2], 'ms': o[3], 'f': o[4], 'site': '+' + m.group(1) if m else '?'})
+            out.append({'i': i, 'cpu': cpu, 'comm': o[2], 'ms': o[3], 'f': o[4],
+                        'site': '+' + m.group(1) if m else '?'})
     return out
 
 
@@ -633,18 +753,22 @@ def tee_idle_lines(out):
     except (OSError, ValueError):
         return []
     thr = f"{t['threshold_ms']:g}"
+    # one copy's count of a block: '<n >= threshold> (<n >= 100 ms>)', n/a when that copy has no block markers
     cnt = lambda s: f"{s['ge_thr']} ({s['ge100']})" if s else 'n/a'
     L = ['', f'## TEE idle: Trusty IRQ-off reports >= {thr} ms (>= 100 ms)', '',
          '| block | deep idle | s | TEE ops / failures | device log | serial | longest (ms) | call sites |',
          '|---|---|---|---|---|---|---|---|']
     for b in t['blocks']:
         best = tee_best(b) or {}
-        L.append(f"| {b['name']} | {'on' if b['deep_idle'] else 'off'} | {b['seconds']} | {b['ops']} / {b['failures']} | "
-                 f"{cnt(b['device'])} | {cnt(b['serial'])} | {', '.join(f'{d:.0f}' for d in best.get('longest', [])) or '-'} | "
+        L.append(f"| {b['name']} | {'on' if b['deep_idle'] else 'off'} | {b['seconds']} | "
+                 f"{b['ops']} / {b['failures']} | "
+                 f"{cnt(b['device'])} | {cnt(b['serial'])} | "
+                 f"{', '.join(f'{d:.0f}' for d in best.get('longest', [])) or '-'} | "
                  f"{', '.join(f'{k} x{v}' for k, v in best.get('sites', {}).items()) or '-'} |")
     return L
 
 
+# ==== Small helpers: step names, phase attribution, numbers from snapshots ============================================
 def step_names(steps):
     """Phase name of each el2_stress step: a repeated step is <step>-r2, -r3, ... (the first keeps the plain name)."""
     n, out = collections.Counter(), []
@@ -662,6 +786,7 @@ def attribute(marks, boot, t):
 
 
 def num(h, k, default=0):
+    """h[k] as an int (a float value truncated); `default` when missing, empty or not a number."""
     try:
         return int(float(h.get(k, default) or default))
     except ValueError:
@@ -669,67 +794,94 @@ def num(h, k, default=0):
 
 
 def fnum(h, k):
+    """h[k] as a float; None when missing or not a number."""
     try:
         return float(h.get(k))
     except (TypeError, ValueError):
         return None
 
 
+# ==== The run: class Run ==============================================================================================
 class Run:
+    """One run of a plan on one device, written into the output directory `out` (events.jsonl, log.txt, health/,
+    the phases' files, summary.md). execute() is the entry point: setup, the plan's phases in order, the final scans
+    and the summary. Each phase type <t> is a method phase_<t>(p) that takes its plan entry p. Phases sleep through
+    wait(), which takes the periodic checkpoints (health snapshot, serial scan, EL2 log); every finding becomes an
+    event through event()."""
     def __init__(self, dev, out, plan):
         self.dev, self.out, self.plan = dev, out, plan
         os.makedirs(os.path.join(out, 'health'), exist_ok=True)
         self.ev = open(os.path.join(out, 'events.jsonl'), 'a')
         self.logf = open(os.path.join(out, 'log.txt'), 'a')
-        self.last = None
-        self.seen = set()
-        self.nsnap = 0
-        self.expect_reboot = False
-        self.phase = 'setup'
-        self.interval = plan.get('health_interval_s', 300)
-        self.lost_timeout = plan.get('lost_timeout_s', 900)
-        self.next_check = 0
-        self.tools = set()
-        self.known_dumps = set()
-        self.el2 = plan.get('el2_monitor')
-        self.el2_order = []
-        self.el2_counts = collections.Counter()
-        self.scanner = None
+        self.last = None            # the previous good snapshot (parse_health), None before the baseline
+        self.seen = set()           # kernel, crash buffer and event lines already graded or recorded
+        self.nsnap = 0              # snapshots taken (numbers the files health/NNNN-<phase>-<tag>.txt)
+        self.expect_reboot = False  # a planned reboot is under way: the next new boot id is not UNEXPECTED_REBOOT
+        self.phase = 'setup'        # current phase name: '<n>-<type>', with '/<step or block>' inside some phases
+        self.interval = plan.get('health_interval_s', 300)  # seconds between checkpoints
+        self.lost_timeout = plan.get('lost_timeout_s', 900)  # seconds a lost device has to come back
+        self.next_check = 0         # host time the next checkpoint is due
+        self.tools = set()          # stress tools pushed to the device (those built in third_party/out/aarch64)
+        self.known_dumps = set()    # pstore files already seen
+        self.el2 = plan.get('el2_monitor')  # the plan's EL2 parallel log settings; None: no EL2 log
+        self.el2_order = []         # monitor module names in load order
+        self.el2_counts = collections.Counter()  # EL2 anomaly events per kind (the first 20 of each are logged)
+        self.scanner = None         # el2_report.Scanner over the pulled EL2 logs
         self.serial = None          # path of a serial capture's line file (host-stamped), written by another process
-        self.serial_scan_off = 0
+        self.serial_scan_off = 0    # capture bytes scanned for fatal markers so far
         self.serial_marks = []      # (epoch, file size) at each snapshot
-        self.serial_stale = False
-        self.nserial = 0
+        self.serial_stale = False   # SERIAL_STALE reported (again only after output came back)
+        self.nserial = 0            # serial windows saved (serial-NNN-<why>.txt)
         self.console, self.console_off = ConsoleHist(), 0  # serial bytes per kernel time (own offset into the capture)
         self.irq_kept = []          # irqsoff intervals of the last 3 snapshots (a waiter's report can come later)
         self.marks = []             # (boot_id, kernel time, phase) of every STAB PHASE_START marker
-        self.probe_retry = False
+        self.probe_retry = False    # this snapshot is the one retry after a PROBE_TIMEOUT
         self.good_t = time.time()   # time of the last good snapshot
         self.held, self.held_once = [], set()  # reports whose console bytes had not reached the capture yet
-        self.group_n = collections.Counter()  # (phase, group) -> preempt/IRQ-off reports seen
+        self.group_n = collections.Counter()  # (phase, group, kind) -> preempt/IRQ-off reports seen
         self.kept_lines = []        # kernel lines of the previous snapshot (a WARN splat can span two snapshots)
         self.degraded = None        # boot id for which HEALTH_DEGRADED was reported
         self.away = False           # battery_rundown: USB unplugged on purpose (no SERIAL_STALE: the device shuts down)
 
-    # ------------------------------------------------------------------ records
+    # ---- Records: events and files -----------------------------------------------------------------------------------
     def event(self, kind, msg='', phase=None, **kw):
-        """phase: the phase the finding belongs to when it is not the current one (kernel lines, by kernel time)."""
-        rec = {'t': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'phase': phase or self.phase, 'kind': kind, 'msg': msg, **kw}
-        self.ev.write(json.dumps(rec, ensure_ascii=False) + '\n'); self.ev.flush()
+        """Records one event: a JSON line in events.jsonl ({t, phase, kind, msg, extra keys such as group and count})
+        and '<time> [<phase>] [ERROR |WARN ]<kind> <msg>' in log.txt and on stdout (ERROR for ERRORS, WARN for
+        WARNINGS). phase: the phase the finding belongs to when it is not the current one (kernel lines, by kernel
+        time)."""
+        rec = {'t': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'phase': phase or self.phase, 'kind': kind, 'msg': msg,
+               **kw}
+        self.ev.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        self.ev.flush()
         sev = 'ERROR' if kind in ERRORS else 'WARN' if kind in WARNINGS else ''
         line = f"{rec['t']} [{rec['phase']}] {sev + ' ' if sev else ''}{kind} {msg}"
-        self.logf.write(line + '\n'); self.logf.flush()
+        self.logf.write(line + '\n')
+        self.logf.flush()
         print(line, flush=True)
 
     def save(self, name, text):
+        """Writes `text` to the file `name` in the output directory (replacing it)."""
         with open(os.path.join(self.out, name), 'w') as f:
             f.write(text)
 
-    # ------------------------------------------------------------------ health
+    # ---- Health snapshots and kernel line grading --------------------------------------------------------------------
     def snapshot(self, tag=''):
+        """One health snapshot (device/health.sh with the marker '<phase> <n> <tag>'), saved as
+        health/NNNN-<phase>[-<tag>].txt and compared with the previous one; returns the parsed snapshot (the one
+        lost() takes when the device gave no answer). The first snapshot is the baseline: what is already there
+        (pstore files, inventory, kernel / crash buffer / event lines) is not a finding. On the baseline and on every
+        new boot: PC_MODE when the device is in desktop mode. On a new boot or after a suspend (tag 'suspend...'): the
+        device inventory (check_inventory). A new boot id is a planned reboot (expect_reboot) or unexpected_reboot();
+        the line comparison and the held reports start over, new pstore records are KERNEL_BAD, the EL2 log is brought
+        up again, and nothing else is compared. On the same boot: HEALTH_DEGRADED (once per boot) when health.sh had
+        no usable copy of the kernel log, KERNEL_LOG_CAPPED, the new kernel lines (grade_kernel), new crash buffer
+        lines (CRASH) and am_anr event lines (ANR), rising tombstone / ANR file / dropbox crash counts, new pstore
+        records (KERNEL_BAD), and a rising suspend failure count: SUSPEND_ABORTED when an alarm was due or a wake
+        interrupt was pending, else SUSPEND_FAIL."""
         last = self.last or {}
-        h = self.dev.health(f'{self.phase} {self.nsnap + 1} {tag}'.strip(), last.get('dmesg_last'), last.get('boot_id'))
-        if self.serial:
+        h = self.dev.health(f'{self.phase} {self.nsnap + 1} {tag}'.strip(), last.get('dmesg_last'),
+                            last.get('boot_id'))
+        if self.serial:  # where the capture was at this time: serial_extract starts its windows from these
             self.serial_marks.append((time.time(), os.path.getsize(self.serial) if os.path.exists(self.serial) else 0))
             self.serial_marks = self.serial_marks[-50:]
         if h is None:
@@ -738,18 +890,20 @@ class Run:
         name = re.sub(r'[^A-Za-z0-9_.-]+', '_', f'{self.phase}{"-" + tag if tag else ""}')
         self.save(f'health/{self.nsnap:04d}-{name}.txt', h['_raw'])
         prev, self.last = self.last, h
-        if (prev is None or h.get('boot_id') != prev.get('boot_id')) and (h.get('pc_mode') == '1' or h.get('desk_visible') == '1'):
+        if ((prev is None or h.get('boot_id') != prev.get('boot_id'))
+                and (h.get('pc_mode') == '1' or h.get('desk_visible') == '1')):
             self.event('PC_MODE', f"device is in desktop (PC) mode (kylin_rotation_state_saved_before_pc_mode="
                        f"{h.get('pc_mode')}, Desk visible={h.get('desk_visible')}): the plans expect tablet mode")
         if prev is None:  # baseline: what is already there is not a finding
             self.known_dumps = set(h.get('pstore_dumps', '').split())
-            self.inventory = set(h['_sec'].get('inventory', []))
+            self.inventory = set(h['_sec'].get('inventory', []))  # the devices every later boot and resume must have
             for s in ('kernel_bad', 'crash_buffer', 'events'):
                 self.seen.update(h['_sec'].get(s, []))
             self.irq_kept = [irq_intervals(h['_sec'].get('kernel_bad', []))]
             return h
         if h['boot_id'] != prev['boot_id'] or tag.startswith('suspend'):
             self.check_inventory(h, tag)
+        # A new boot: classify the reboot, start the comparison over
         if h['boot_id'] != prev['boot_id']:
             if self.expect_reboot:
                 self.expect_reboot = False
@@ -764,10 +918,12 @@ class Run:
             new_dumps = set(h.get('pstore_dumps', '').split()) - self.known_dumps
             if new_dumps:
                 self.known_dumps |= new_dumps
-                self.event('KERNEL_BAD', f'new panic/oops record in pstore after the reboot: {" ".join(sorted(new_dumps))}')
+                self.event('KERNEL_BAD', 'new panic/oops record in pstore after the reboot: '
+                           f'{" ".join(sorted(new_dumps))}')
             if self.el2:
                 self.el2_up()
             return h
+        # The same boot: compare with the previous snapshot
         if (not h.get('dmesg_last') or h.get('kernel_src', 'file') != 'file') and self.degraded != h['boot_id']:
             self.degraded = h['boot_id']
             self.event('HEALTH_DEGRADED', f"health.sh had no usable copy of the kernel log (kernel_src="
@@ -802,8 +958,8 @@ class Run:
         elif num(h, 'suspend_fail') > num(prev, 'suspend_fail') and not rose and adev:
             # A wake interrupt that arrives while the CPUs are frozen aborts the suspend (the kernel's normal behaviour;
             # seen with the Wi-Fi PCIe controller right after network load, on stock too)
-            self.event('SUSPEND_ABORTED', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}: wake interrupt "
-                       f"pending from {adev} ({h.get('wakeup_reason', '')[:200]})")
+            self.event('SUSPEND_ABORTED', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}: "
+                       f"wake interrupt pending from {adev} ({h.get('wakeup_reason', '')[:200]})")
         elif num(h, 'suspend_fail') > num(prev, 'suspend_fail'):
             self.event('SUSPEND_FAIL', f"fail {num(prev, 'suspend_fail')} -> {num(h, 'suspend_fail')}, "
                        f"last_failed_dev={h.get('suspend_last_failed_dev')} step={h.get('suspend_last_failed_step')}")
@@ -823,7 +979,9 @@ class Run:
         self.kept_lines = lines
 
     def grade_lines(self, lines, boot, context, hist, hold=False):
-        """Grades the unseen lines of boot `boot` (grade_kernel); context: the lines for WARN splat windows."""
+        """Grades the unseen lines of boot `boot` (grade_kernel); context: the lines for WARN splat windows; hist: the
+        console histogram (None without a capture). hold: a preempt/IRQ-off report of 100 ms or more whose end the
+        histogram has not reached yet goes to self.held (once per line) and is graded with the next snapshot."""
         irqs = {i for batch in self.irq_kept for i in batch}
         windows = printout_windows(context)
         more = {}  # (phase, group, kind) -> [count, max D, its F]
@@ -833,7 +991,8 @@ class Run:
             off = parse_off(line)
             if (hold and hist is not None and hist.top is not None and off and off[3] >= 100.0
                     and line not in self.held_once and hist.top < off[4] + off[3] / 1000):
-                self.held.append(line); self.held_once.add(line)
+                self.held.append(line)
+                self.held_once.add(line)
                 continue
             self.seen.add(line)
             kind, why = kernel_grade(line, windows=windows, irqs=irqs, hist=hist)
@@ -847,10 +1006,10 @@ class Run:
             cls = 'short' if off[3] < 100.0 else REASON_CLASS.get(why.split(' ')[0], 'none')
             group = f"{off[0]} {re.sub(r'[0-9]+', 'N', off[2])} {cls}"
             self.group_n[(ph, group, kind)] += 1
-            if self.group_n[(ph, group, kind)] <= GROUP_FIRST:
+            if self.group_n[(ph, group, kind)] <= GROUP_FIRST:  # the first ones of a group: one event each
                 self.event(kind, line[:300] + (f' [{why}]' if why else '') + tail, phase=ph, group=group)
                 continue
-            m = more.setdefault((ph, group, kind), [0, 0.0, 0.0])
+            m = more.setdefault((ph, group, kind), [0, 0.0, 0.0])  # the rest: counted, one event per group below
             m[0] += 1
             if off[3] > m[1]:
                 m[1], m[2] = off[3], off[4]
@@ -873,7 +1032,8 @@ class Run:
                     b = f.read(min(8 << 20, end - self.console_off))
                     if not b:
                         break
-                    self.console.feed(b); self.console_off += len(b)
+                    self.console.feed(b)
+                    self.console_off += len(b)
         except OSError:
             return None
         return self.console
@@ -949,6 +1109,10 @@ class Run:
         return self.snapshot(tag + '-after-lost')
 
     def unexpected_reboot(self, prev, h):
+        """A new boot id that no phase planned (prev, h: the snapshots before and after): the pstore files the new
+        snapshot lists (the previous boot's panic / console records) copied into pstore-NNNN/ (NNNN: events so far + 1),
+        the first panic, watchdog or preempt-off line among them as a hint, a serial window (serial_extract), and
+        UNEXPECTED_REBOOT with the boot reasons (sys.boot.reason, its history, the boot loader's)."""
         n = sum(1 for _ in open(os.path.join(self.out, 'events.jsonl'))) + 1
         d = os.path.join(self.out, f'pstore-{n:04d}')
         os.makedirs(d, exist_ok=True)
@@ -969,8 +1133,11 @@ class Run:
                    f"{h.get('boot_reason')} history={h.get('boot_reason_last')} bootloader={h.get('bootloader_reason')}"
                    f"; pstore {' '.join(files)} saved to {os.path.basename(d)}; {hint}")
 
+    # ---- Serial console: windows and scans ---------------------------------------------------------------------------
     def serial_extract(self, why, before_s=600, cap=30 << 20):
-        """Serial lines from about before_s seconds before now to the end of the capture, into serial-NNN-<why>.txt."""
+        """Serial lines from about before_s seconds before now to the end of the capture, into serial-NNN-<why>.txt.
+        The start is the capture size at the last snapshot at least before_s ago (serial_marks), else at the oldest
+        mark; never more than `cap` bytes (30 MiB)."""
         if not self.serial or not os.path.exists(self.serial):
             return
         end = os.path.getsize(self.serial)
@@ -980,10 +1147,14 @@ class Run:
         self.nserial += 1
         name = f'serial-{self.nserial:03d}-{why}.txt'
         with open(self.serial, 'rb') as f, open(os.path.join(self.out, name), 'wb') as o:
-            f.seek(start); o.write(f.read(end - start))
+            f.seek(start)
+            o.write(f.read(end - start))
         self.event('INFO', f'serial window saved: {name} ({(end - start) >> 10} KiB)')
 
     def serial_scan(self):
+        """Scans the capture's bytes added since the last scan: SERIAL_STALE once when nothing was added (not while
+        the device is away on purpose), HV_WAKEUP_AUDIT for the first 5 XHYPER_VCPU_WAKEUP_LOST lines, SERIAL_FATAL
+        for the first 10 fatal marker lines (SERIAL_FATAL pattern) and then a serial window."""
         if not self.serial or not os.path.exists(self.serial):
             return
         end = os.path.getsize(self.serial)
@@ -1006,7 +1177,10 @@ class Run:
         if hits:
             self.serial_extract('serial-fatal')
 
+    # ---- Core loop: checkpoint (wait() follows the EL2 section) ------------------------------------------------------
     def checkpoint(self, tag=''):
+        """When due (every self.interval seconds): a health snapshot, a serial scan and, with the EL2 parallel log, a
+        pull and scan of the EL2 logs; otherwise nothing."""
         if time.time() >= self.next_check:
             self.snapshot(tag)
             self.serial_scan()
@@ -1014,20 +1188,29 @@ class Run:
                 self.el2_pull_scan()
             self.next_check = time.time() + self.interval
 
-    # ------------------------------------------------------------------ EL2 parallel log
+    # ---- EL2 parallel log: monitor modules and the device-side sampling loop -----------------------------------------
     def el2_setup(self):
+        """Prepares the EL2 parallel log (plan key el2_monitor): the monitor's .ko files (directory `artifacts`, with
+        environment variables expanded) and device/el2log.sh pushed to the device, logs of earlier runs removed there,
+        the cpufreq policies saved (el2-policies.txt), the scanner created, then el2_up(). EL2_LOG_DOWN and no EL2 log
+        for this run when the directory is missing or the push fails."""
         art = os.path.expanduser(os.path.expandvars(self.el2['artifacts']))
         if '$' in art or not os.path.isdir(art):
             self.event('EL2_LOG_DOWN', f"monitor module directory not found: {self.el2['artifacts']} -> {art} "
-                       '(set XHYPER_MONITOR_ARTIFACTS)'); self.el2 = None; return
+                       '(set XHYPER_MONITOR_ARTIFACTS)')
+            self.el2 = None
+            return
         self.el2_order = ko_load_order(art)
         kos = [os.path.join(art, f'{m}.ko') for m in self.el2_order]
         # Logs of earlier runs were pulled by those runs; a stale log would be scanned again as this run's data.
-        self.dev.su(f'kill $(cat {DEV}/el2/el2log.pid 2>/dev/null) 2>/dev/null; rm -f {DEV}/el2/*.log {DEV}/el2/el2log.pid; '
+        self.dev.su(f'kill $(cat {DEV}/el2/el2log.pid 2>/dev/null) 2>/dev/null; '
+                    f'rm -f {DEV}/el2/*.log {DEV}/el2/el2log.pid; '
                     f'mkdir -p {DEV}/xhmon {DEV}/el2 && chmod 777 {DEV}/xhmon {DEV}/el2')
         rc, out = self.dev.adb('push', *kos, os.path.join(REPO, 'device', 'el2log.sh'), f'{DEV}/xhmon/', timeout=300)
         if rc != 0:
-            self.event('EL2_LOG_DOWN', 'push of monitor modules failed: ' + out[-200:]); self.el2 = None; return
+            self.event('EL2_LOG_DOWN', 'push of monitor modules failed: ' + out[-200:])
+            self.el2 = None
+            return
         _, pol = self.dev.sh('for p in /sys/devices/system/cpu/cpufreq/policy*; do '
                              'echo "${p##*/}:$(tr " " "," < $p/related_cpus)"; done', timeout=30)
         self.save('el2-policies.txt', pol.strip() + '\n')
@@ -1040,6 +1223,9 @@ class Run:
         """Monitor modules loaded, monitor counting, sampling loop running (all idempotent; after every boot)."""
         mods = ' '.join(self.el2_order)
         iv = self.el2.get('interval_s', 1)
+        # Modules loaded unless the monitor's /proc file is there; the monitor started unless its counts move; the
+        # sampling loop started unless its pid file names a running el2log.sh. Prints EL2_UP at the end (NO_STATS and
+        # exit 1 when the monitor's /proc file is missing).
         cmd = (f'if [ ! -e /proc/xcore_stats ]; then for m in {mods}; do grep -q "^$m " /proc/modules || '
                f'insmod {DEV}/xhmon/$m.ko || echo "INSMOD_FAIL $m"; done; fi; '
                '[ -e /proc/xcore_stats ] || { echo NO_STATS; exit 1; }; '
@@ -1059,6 +1245,8 @@ class Run:
         return True
 
     def el2_pull_scan(self):
+        """Pulls the device's EL2 logs into el2/ and scans the new samples (el2_report.Scanner): the first 20 anomalies
+        of each kind are events, then one 'more of these' event; all are counted in el2-summary.md."""
         self.dev.adb('pull', f'{DEV}/el2/.', os.path.join(self.out, 'el2'), timeout=300)
         if not self.scanner:
             return
@@ -1069,14 +1257,23 @@ class Run:
             elif self.el2_counts[kind] == 21:
                 self.event(kind, 'more of these: counted in el2-summary.md, not logged one by one')
 
+    # ---- Core loop: wait ---------------------------------------------------------------------------------------------
     def wait(self, seconds, tag=''):
+        """Sleeps `seconds` in steps of at most 15 s, taking the checkpoints that fall due (tag: their snapshot tag)."""
         end = time.time() + seconds
         while time.time() < end:
             self.checkpoint(tag)
             time.sleep(min(15, max(0, end - time.time())))
 
-    # ------------------------------------------------------------------ setup
+    # ---- Setup: device files, identity, baseline; APKs, dialogs, tools, screen ---------------------------------------
     def setup(self, expect_sha):
+        """Prepares the device and the run: the device must answer on adb (else Abort); device/health.sh,
+        el2stress.sh, rundown.sh, klogwatch.sh and the stress tools built in third_party/out/aarch64 (stress-ng,
+        stressapptest, cyclictest, hackbench; self.tools) pushed to DEV; boot_a's sha256, the build fingerprint, uname
+        and the kernel command line saved in identity.txt; IDENTITY_MISMATCH and Abort when boot_a's sha256 does not
+        start with expect_sha; with a serial capture, the scan starts at its current end (the console histogram 1 MiB
+        before it); the baseline snapshot; the EL2 parallel log when the plan has one; the first checkpoint due one
+        interval later."""
         if not self.dev.alive():
             raise Abort(f'device {self.dev.serial} not reachable')
         self.dev.su(f'mkdir -p {DEV}/tmp && chmod 777 {DEV} {DEV}/tmp')
@@ -1084,7 +1281,8 @@ class Run:
         tdir = os.path.join(REPO, 'third_party', 'out', 'aarch64')
         for t in ('stress-ng', 'stressapptest', 'cyclictest', 'hackbench'):
             if os.path.exists(os.path.join(tdir, t)):
-                files.append(os.path.join(tdir, t)); self.tools.add(t)
+                files.append(os.path.join(tdir, t))
+                self.tools.add(t)
         rc, out = self.dev.adb('push', *files, f'{DEV}/', timeout=300)
         if rc != 0:
             raise Abort('adb push failed: ' + out[-300:])
@@ -1106,8 +1304,11 @@ class Run:
         self.next_check = time.time() + self.interval
 
     def ensure_apks(self, keys):
-        """Install the APKs named in third_party/apks.lock from STAB_APK_DIR, after checking their sha256."""
-        lock = {}
+        """Install the APKs named in third_party/apks.lock from STAB_APK_DIR, after checking their sha256.
+        SKIP when a key is not in the lock, when its file is not in STAB_APK_DIR and the package is not installed (an
+        installed package without a file is left as it is), when the file's sha256 differs, or when `adb install`
+        does not answer Success (INFO when it does)."""
+        lock = {}  # key -> [key, file name, package, version, sha256, install flags or '-']
         for line in open(os.path.join(REPO, 'third_party', 'apks.lock')):
             f = line.split()
             if len(f) >= 6 and not line.startswith('#'):
@@ -1115,7 +1316,8 @@ class Run:
         d = os.environ.get('STAB_APK_DIR', '')
         for k in keys:
             if k not in lock:
-                self.event('SKIP', f'apk {k}: not in third_party/apks.lock'); continue
+                self.event('SKIP', f'apk {k}: not in third_party/apks.lock')
+                continue
             _, fname, pkg, ver, sha, flags = lock[k][:6]
             _, have = self.dev.sh(f'pm path {pkg}', timeout=30)
             path = os.path.join(d, fname)
@@ -1126,18 +1328,23 @@ class Run:
             import hashlib
             h = hashlib.sha256(open(path, 'rb').read()).hexdigest()
             if h != sha:
-                self.event('SKIP', f'apk {k}: {fname} sha256 {h[:16]} is not the locked {sha[:16]}'); continue
+                self.event('SKIP', f'apk {k}: {fname} sha256 {h[:16]} is not the locked {sha[:16]}')
+                continue
             args = ['install', '-r'] + ([flags] if flags != '-' else []) + [path]
             rc, out = self.dev.adb(*args, timeout=600)
-            self.event('INFO' if 'Success' in out else 'SKIP', f'apk {k} ({pkg} {ver}): ' + out.strip().splitlines()[-1][:120])
+            self.event('INFO' if 'Success' in out else 'SKIP',
+                       f'apk {k} ({pkg} {ver}): ' + out.strip().splitlines()[-1][:120])
 
     def dismiss_anr_dialogs(self, tag, tries=4):
-        """A not-responding dialog left on screen blocks every later UI step: answer 'wait' (等待) and record it."""
+        """A not-responding dialog left on screen blocks every later UI step: answer 'wait' (等待) and record it
+        (ANR_DIALOG); the button is found in a uiautomator dump, else the dialog gets the back key. Up to `tries`
+        dialogs, 2 s apart."""
         for _ in range(tries):
             _, f = self.dev.sh('dumpsys window | grep -m1 mCurrentFocus', timeout=60)
             if 'Not Responding' not in f:
                 return
-            _, x = self.dev.sh('uiautomator dump /sdcard/stab-ui.xml >/dev/null 2>&1; cat /sdcard/stab-ui.xml', timeout=90)
+            _, x = self.dev.sh('uiautomator dump /sdcard/stab-ui.xml >/dev/null 2>&1; cat /sdcard/stab-ui.xml',
+                               timeout=90)
             m = re.search(r'text="(?:等待|Wait)"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', x or '')
             who = re.search(r'Not Responding: ([^}\s]+)', f)
             self.event('ANR_DIALOG', f'{tag}: dialog for {who.group(1) if who else "?"} answered with wait')
@@ -1149,19 +1356,29 @@ class Run:
             time.sleep(2)
 
     def tool(self, name):
+        """Whether stress tool `name` was pushed (built on the host); SKIP when not, the caller skips its step."""
         if name in self.tools:
             return True
         self.event('SKIP', f'{name} not built (third_party/out/aarch64/{name}); step skipped')
         return False
 
     def screen(self, on):
+        """Screen on (wake-up key, keyguard dismissed) or off (sleep key)."""
         if on:
             self.dev.sh('input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard', timeout=30)
         else:
             self.dev.sh('input keyevent KEYCODE_SLEEP', timeout=30)
 
-    # ------------------------------------------------------------------ phases
+    # ---- Phase reboot_loop: repeated reboots -------------------------------------------------------------------------
     def phase_reboot_loop(self, p):
+        """Reboot loop: the boot path under the hypervisor and the bring-up of every CPU, by repeated reboots.
+
+        Each of `count` (default 10) rounds: a snapshot (pre-reboot<i>), a planned `adb reboot` (expect_reboot), 15 s,
+        up to 300 s for adb and 400 s more for sys.boot_completed, `settle_s` (default 60) s, and a snapshot
+        (reboot<i>) on the new boot, which also checks the device inventory and new pstore records.
+        Records: INFO 'reboot <i>: booted in <s> s, reason <sys.boot.reason>, pstore <files>'; BOOT_REASON (warning)
+        when sys.boot.reason does not start with 'reboot'; BOOT_FAIL (error) and Abort when the device is not booted
+        within 700 s or its boot id did not change (the reboot did not happen). Nothing to restore."""
         for i in range(1, p.get('count', 10) + 1):
             pre = self.snapshot(f'pre-reboot{i}')
             self.expect_reboot = True
@@ -1183,7 +1400,12 @@ class Run:
                 self.event('BOOT_REASON', f'reboot {i}: sys.boot.reason={reason}')
             self.event('INFO', f'reboot {i}: booted in {up:.0f} s, reason {reason}, pstore {h.get("pstore")}')
 
+    # ---- Phase soak: monkey, stress-ng bursts, screen cycles, music --------------------------------------------------
     def stress_burst(self, seconds, args, tag):
+        """One stress-ng run of `seconds` with `args` as root in DEV/tmp (also used by monitor_soak); its output saved
+        as stress-<tag>.txt. Exit 0: INFO; exit 3 (a stressor that cannot run here): SKIP with the skip lines; any
+        other exit: STRESS_FAIL with the fail / error lines; no exit code: DEVICE_LOST when adb timed out, else
+        STRESS_FAIL, and a snapshot. SKIP (tool()) when stress-ng is not built."""
         if not self.tool('stress-ng'):
             return
         cmd = (f'cd {DEV}/tmp && {DEV}/stress-ng {args} --timeout {seconds}s --metrics-brief --temp-path {DEV}/tmp; '
@@ -1205,6 +1427,10 @@ class Run:
                        ' | '.join(l for l in out.splitlines() if re.search(r'fail|error', l, re.I))[:300])
 
     def monkey(self, start, p=None):
+        """start: monkey started detached on the plan's `packages` only (no system keys, no 'any' events; crashes,
+        timeouts and security exceptions ignored, native crashes watched), `throttle_ms` (default 300) ms between
+        events, enough events for `minutes` plus 1000. Not start: monkey stopped, its log saved as monkey.log,
+        MONKEY_CRASH / MONKEY_ANR (warnings) with a count per app."""
         if not start:
             self.dev.sh('pkill -f com.android.commands.monkey', timeout=30)
             _, log = self.dev.sh(f'cat {DEV}/monkey.log', timeout=60)
@@ -1220,6 +1446,7 @@ class Run:
                     f'-v {count} > {DEV}/monkey.log 2>&1 &', timeout=30)
 
     def music_state(self, pkg):
+        """Playback state of package pkg's session in dumpsys media_session (e.g. PLAYING, PAUSED); 'NONE' without."""
         _, out = self.dev.sh('dumpsys media_session', timeout=30)
         m = re.search(r'package=' + re.escape(pkg) + r'.*?state=PlaybackState \{state=([A-Z_]+)|package='
                       + re.escape(pkg) + r'[\s\S]{0,800}?state=([A-Z_]+)\(', out)
@@ -1228,9 +1455,13 @@ class Run:
     def music_play(self, mu):
         """Plays mu['path'] in the music app's track page through a VIEW intent on its MediaStore entry (the way
         workspace tools/perf/t11206-music.sh drives the Kylin music app). Volume set with key events (the media_session
-        volume command does not move the speaker index on T11206)."""
+        volume command does not move the speaker index on T11206). mu: the soak plan's `music`: path (default
+        /sdcard/Music/test.mp3), package (com.kylinos.music), local (a host copy pushed again when the track is
+        missing), volume (3), mime (audio/mpeg), activity (.activities.TrackActivity). Returns whether playback was
+        started: False with SKIP (once per run) when the track is not in the device's media library."""
         pkg = mu.get('package', 'com.kylinos.music')
-        _, q = self.dev.sh('content query --uri content://media/external/audio/media --projection _id:_data', timeout=30)
+        _, q = self.dev.sh('content query --uri content://media/external/audio/media --projection _id:_data',
+                           timeout=30)
         m = re.search(r'_id=(\d+), _data=\S*/' + re.escape(os.path.basename(mu.get('path', '/sdcard/Music/test.mp3')))
                       + r'\b', q)
         if not m and mu.get('local') and os.path.exists(os.path.expandvars(os.path.expanduser(mu['local']))):
@@ -1245,8 +1476,10 @@ class Run:
         if not m:
             if not getattr(self, '_music_skip', False):
                 self._music_skip = True
-                self.event('SKIP', f"music: {mu.get('path', '/sdcard/Music/test.mp3')} not in the device's media library")
+                self.event('SKIP',
+                           f"music: {mu.get('path', '/sdcard/Music/test.mp3')} not in the device's media library")
             return False
+        # 15 steps down to 0, then `volume` steps up
         keys = ' '.join(['KEYCODE_VOLUME_DOWN'] * 15 + ['KEYCODE_VOLUME_UP'] * int(mu.get('volume', 3)))
         self.dev.sh(f'input keyevent {keys}', timeout=60)
         self.dev.sh(f'am start -a android.intent.action.VIEW -d content://media/external/audio/media/{m.group(1)} '
@@ -1258,6 +1491,18 @@ class Run:
         return True
 
     def phase_soak(self, p):
+        """Soak: everyday use under the hypervisor (device interrupts, timers, IPIs from app activity) with periodic
+        targeted stress (IPIs, timers, memory, depending on stress_args).
+
+        For `minutes`: monkey random input confined to the plan's `packages` (`monkey`, default on; `throttle_ms`,
+        default 300); a stress-ng burst (stress_burst) of `stress_seconds` (default 120) with `stress_args` every
+        `stress_every_min` (default 10) minutes, the first after 60 s (none without stress_args); the screen off for
+        `screen_off_s` (default 90) s every `screen_cycle_min` (default 15) minutes; with `music` (music_play) a track
+        played in the music app, checked every `check_every_s` (default 300) s and started again when not PLAYING.
+        Snapshots every health interval.
+        Records: each burst's INFO / SKIP / STRESS_FAIL / DEVICE_LOST, MONKEY_CRASH and MONKEY_ANR (warnings) at the
+        end, and what the snapshots find. Restores (also on an abort): monkey stopped, playback paused (a forced
+        suspend in a later phase that cuts playback pops), the screen on."""
         mu = p.get('music')
         if mu:
             self.music_play(mu)
@@ -1279,7 +1524,9 @@ class Run:
                         self.music_play(mu)
                     next_music = time.time() + mu.get('check_every_s', 300)
                 if time.time() >= next_screen:
-                    self.screen(False); self.wait(p.get('screen_off_s', 90), 'screen-off'); self.screen(True)
+                    self.screen(False)
+                    self.wait(p.get('screen_off_s', 90), 'screen-off')
+                    self.screen(True)
                     next_screen = time.time() + p.get('screen_cycle_min', 15) * 60
                 self.wait(min(30, max(1, end - time.time())))
         finally:
@@ -1289,9 +1536,16 @@ class Run:
                 self.dev.sh('cmd media_session dispatch pause', timeout=30)
             self.screen(True)
 
+    # ---- Phase suspend: forced system suspends -----------------------------------------------------------------------
     def suspend_once(self, sleep_s, i):
         """One forced suspend; returns (snapshot after it, seconds until adb came back, wake source); the seconds are
-        None when adb never dropped (suspend refused, or adb survived it) or never came back."""
+        None when adb never dropped (suspend refused, or adb survived it) or never came back.
+        Procedure: snapshot pre-suspend<i>, screen off, wait for audio playback to stop (wait_audio_idle), `rtcwake -m
+        mem -s <sleep_s>` started detached as root, up to 30 s for adb to drop (if it does not, sleep_s + 5 s), up to
+        sleep_s + 180 s for adb to come back, snapshot suspend<i> (it checks the inventory and the suspend counters).
+        Records: RESUME_TIMEOUT (error) when adb is not back; SUSPEND_NOT_ENTERED (warning) when neither the success
+        nor the fail count rose; INFO 'suspend <i>: success +<n> fail +<n>, adb back after <s> s | adb never dropped,
+        woke by <device>'. Wake source 'reboot' when the boot id changed."""
         h0 = self.snapshot(f'pre-suspend{i}')
         s0, f0 = num(h0, 'suspend_success'), num(h0, 'suspend_fail')
         self.screen(False)
@@ -1338,13 +1592,30 @@ class Run:
         return False
 
     def phase_suspend(self, p):
+        """Suspend: system suspend and resume under the hypervisor (every CPU powered down and up through the power
+        calls, the wake interrupt), by forced suspends with an alarm wake-up.
+
+        `cycles` (default 50) times suspend_once with `sleep_s` (default 20) s of alarm, then the screen on and
+        `awake_s` (default 10) s awake. Records: per cycle those of suspend_once; the snapshots add SUSPEND_FAIL
+        (error), SUSPEND_ABORTED (warning) and DEVICE_MISSING (error, a device not back after the resume). Leaves the
+        screen on."""
         for i in range(1, p.get('cycles', 50) + 1):
             self.suspend_once(p.get('sleep_s', 20), i)
             self.screen(True)
             time.sleep(p.get('awake_s', 10))
         self.screen(True)
 
+    # ---- Phase memtest: stressapptest --------------------------------------------------------------------------------
     def phase_memtest(self, p):
+        """Memtest: memory contents under heavy load (stage-2 mappings, cache maintenance under the hypervisor; a
+        fault shows as a data mismatch).
+
+        stressapptest started detached as root for `minutes` (default 30) on `mem_pct` (default 25) % of the
+        snapshot's MemAvailable (at least 64 MiB), with -m 4 -i 2 -C 2 -W (4 copy threads, 2 invert threads, 2 CPU
+        stress threads, the more CPU-intensive copy); waits minutes + 60 s (snapshots go on), then saves its log as
+        stressapptest.log. Records: INFO with size and length, then INFO 'stressapptest PASS', or MEMTEST_FAIL (error)
+        when the last 'Status:' line is not PASS or there is none, with the log's error lines. SKIP when stressapptest
+        is not built. Nothing to restore (the tool ends by itself)."""
         if not self.tool('stressapptest'):
             return
         h = self.snapshot('pre-memtest')
@@ -1363,9 +1634,16 @@ class Run:
         else:
             self.event('INFO', 'stressapptest PASS')
 
+    # ---- Phase standby: long forced suspends -------------------------------------------------------------------------
     def phase_standby(self, p):
         """Forced suspends of suspend_s each until `hours` have passed (a cycle starts while time is left), then the
-        real sleep lengths (seconds until adb came back) and wake sources: STANDBY_SHORT when they were cut short."""
+        real sleep lengths (seconds until adb came back) and wake sources: STANDBY_SHORT when they were cut short.
+
+        Standby: resume after long deep sleep under the hypervisor. Parameters: `hours` (required), `suspend_s`
+        (default 1500), `awake_s` (default 30, screen on). Records: per cycle those of suspend_once (snapshot tags
+        suspendstandby<n>); at the end INFO with the cycle count, the median and longest time until adb came back and
+        the wake sources (standby_summary), and STANDBY_SHORT (warning) when the median is below half of suspend_s
+        (with USB power connected the charger driver arms a wake alarm a few seconds ahead). Leaves the screen on."""
         end, s, cycles = time.time() + p['hours'] * 3600, p.get('suspend_s', 1500), []
         while time.time() < end:
             _, back, why = self.suspend_once(s, f'standby{len(cycles) + 1}')
@@ -1378,7 +1656,16 @@ class Run:
         if short:
             self.event('STANDBY_SHORT', short)
 
+    # ---- Phase latency: cyclictest -----------------------------------------------------------------------------------
     def phase_latency(self, p):
+        """Latency: timer injection and the wake-up path under the hypervisor, measured as wake-up latency.
+
+        cyclictest -m -p 90 -i 1000 -t -a -q (memory locked, priority 90, a 1 ms interval, one thread per CPU, pinned)
+        for `seconds` (default 60), first on the idle device, then with stress-ng `stress_args` (default '--cpu 4
+        --switch 2') running alongside for seconds + 10 s (only when stress-ng is built). Output saved as
+        cyclictest-idle.txt and cyclictest-stress.txt. Records: INFO 'cyclictest <idle|stress>: max latency per thread
+        [...] us'; there is no threshold, so nothing here is a failure by itself. SKIP when cyclictest is not built.
+        Nothing to restore."""
         if not self.tool('cyclictest'):
             return
         for load in ('idle', 'stress'):
@@ -1392,9 +1679,29 @@ class Run:
             mx = [int(x) for x in re.findall(r'Max:\s+(\d+)', out)]
             self.event('INFO', f'cyclictest {load}: max latency per thread {mx} us')
 
+    # ---- Phase el2_stress: device/el2stress.sh, one exit class per step ----------------------------------------------
     def phase_el2_stress(self, p):
         """Steps of device/el2stress.sh, one exit class each, measured: EL2 share per CPU from the EL2 parallel log and
-        the hypervisor's hot-path counters (XHYPER_*_INPLACE, SGI, idle-wake lines) from the serial console."""
+        the hypervisor's hot-path counters (XHYPER_*_INPLACE, SGI, idle-wake lines) from the serial console.
+
+        EL2 stress: each step drives one kind of exit to the hypervisor (the step list and what each one does are in
+        device/el2stress.sh's header: ipi, timer, idle, traffic, affinity, hotplug, pmu, radio, copy, gpu, tee, all).
+        Parameters: `steps` (default ipi, timer, idle, traffic, affinity, hotplug, pmu, all; a repeated step runs as
+        <step>-r2, ... with its own phase, events, files and EL2 summary row), `seconds` per step (default 180).
+        glmark2 is installed first (ensure_apks) when the plan's `steps` name gpu or all (not for the default list).
+        Per step (<name>: the step, or <step>-r<n>): phase <phase>/<name>, PHASE_START and a kernel-log marker; for
+        pmu with the EL2 log the monitor is stopped first (it owns the PMU while it counts) and brought up again
+        after; traffic, affinity and all also get USB bulk traffic from the host (not through a remote adb server);
+        `el2stress.sh <step> <seconds> <gateway>` (the Wi-Fi default gateway, for the ping flood) started detached as
+        root; the step's seconds waited (checkpoints go on), then up to 300 s more for its 'EL2STRESS_DONE <step>'
+        line; any not-responding dialog dismissed; output saved as el2stress-<name>.txt, the step's XHYPER_ serial
+        lines as el2stress-<name>-serial.txt.
+        Records: STRESS_FAIL (error) when EL2STRESS_DONE did not come (plus a snapshot) and for every 'EL2STRESS ...'
+        line with an rc other than 0; INFO with the step's part lines; INFO with the hypervisor counters at the end
+        (the last *_INPLACE, *_COUNTS, *IDLE_WAKE and *REFUSED line of each name); EL2_LOAD with the EL2 share
+        mean/max per CPU over the step; PHASE_END. The steps restore what they change (el2stress.sh); after the last
+        step the outer phase gets a new marker."""
+        # the Wi-Fi default gateway: the target of the traffic step's ping flood ('' without Wi-Fi)
         _, rt = self.dev.sh('ip route show table all', timeout=30)
         m = re.search(r'default via (\S+) dev wlan0', rt)
         gw = m.group(1) if m else ''
@@ -1408,6 +1715,7 @@ class Run:
             self.event('PHASE_START', f'{name} {secs} s')
             self.mark_phase()
             t0 = time.time()
+            # capture size at the step's start: the step's hypervisor lines are read from here
             soff = os.path.getsize(self.serial) if self.serial and os.path.exists(self.serial) else 0
             if step == 'pmu' and self.el2:  # the monitor owns the PMU while it counts
                 self.dev.su('echo 0 > /proc/xcore_stats', timeout=30)
@@ -1421,6 +1729,7 @@ class Run:
             self.dev.su(f'nohup sh {DEV}/el2stress.sh {step} {secs} {gw} > {DEV}/tmp/el2stress-{step}.log 2>&1 &',
                         timeout=30)
             self.wait(secs, name)
+            # the script ends after its parts finish: up to 300 s past the step's seconds for its last line
             out, end = '', time.time() + 300
             while time.time() < end:
                 _, out = self.dev.su(f'cat {DEV}/tmp/el2stress-{step}.log', timeout=30)
@@ -1449,16 +1758,18 @@ class Run:
                     hv = [l for l in f.read().splitlines() if b'XHYPER_' in l]
                 with open(os.path.join(self.out, f'el2stress-{name}-serial.txt'), 'wb') as o:
                     o.write(b'\n'.join(hv) + b'\n')
-                last = {}
+                last = {}  # XHYPER_<name> -> its last line in this step
                 for l in hv:
                     mm = re.search(rb'(XHYPER_[A-Z0-9_]+)', l)
                     if mm:
                         last[mm.group(1).decode()] = l.decode('utf-8', 'replace')
                 keep = [v for k, v in last.items() if k.endswith(('_INPLACE', '_COUNTS', 'IDLE_WAKE', 'REFUSED'))]
-                self.event('INFO', f'{name}: hypervisor counters at end: ' + ' || '.join(x[13:200] for x in keep)[:900])
+                # x[13:]: without the capture's 'HH:MM:SS.mmm ' host stamp
+                self.event('INFO', f'{name}: hypervisor counters at end: '
+                           + ' || '.join(x[13:200] for x in keep)[:900])
             if self.el2:
                 self.el2_pull_scan()
-                w = el2_report.window(self.out, t0 + 5, time.time())
+                w = el2_report.window(self.out, t0 + 5, time.time())  # from 5 s after the step's start
                 if w:
                     self.event('EL2_LOAD', f'{name}: EL2 share mean/max per CPU ' +
                                ' '.join(f'{c}:{m_:.0%}/{x:.0%}' for c, (m_, x, _) in w.items()))
@@ -1466,10 +1777,21 @@ class Run:
         self.phase = base
         self.mark_phase()  # back in the outer phase: later kernel lines are not the last step's
 
+    # ---- Phase monitor_soak: the EL2 monitor under load --------------------------------------------------------------
     def phase_monitor_soak(self, p):
+        """Monitor soak (optional): the EL2 cycle monitor itself (a driver and a PMU user in the system, extra
+        hypercalls around deep idle) under load.
+
+        The monitor is enabled with the el2-monitor.sh script of the xhyper-el2-monitor-android skill (`skill`: its
+        path; `artifacts`: the monitor's module directory, environment variables expanded), its output saved as
+        monitor-enable.txt; MONITOR_FAIL (error) and the phase ends when it does not print EL2-MONITOR-ENABLED. Then
+        for `minutes` (default 30), in rounds: a stress-ng burst of `stress_seconds` (default 60) with `stress_args`
+        (when given), /proc/xcore_stats read, MONITOR_FAIL when any CPU's EL2 cycle count went down since the last
+        round, 60 s wait. Restores: the monitor stopped with the same script (not after an abort)."""
         script = os.path.expanduser(p.get('skill', '~/.codex/skills/xhyper-el2-monitor-android/scripts/el2-monitor.sh'))
         r = subprocess.run(['bash', script, 'enable', '-s', self.dev.serial, '--out', os.path.join(self.out, 'monitor'),
-                            os.path.expanduser(os.path.expandvars(p['artifacts']))], capture_output=True, text=True, errors='replace')
+                            os.path.expanduser(os.path.expandvars(p['artifacts']))],
+                           capture_output=True, text=True, errors='replace')
         self.save('monitor-enable.txt', r.stdout + r.stderr)
         if 'EL2-MONITOR-ENABLED' not in r.stdout:
             self.event('MONITOR_FAIL', 'monitor enable failed: ' + (r.stdout + r.stderr).strip().splitlines()[-1][:200])
@@ -1488,7 +1810,7 @@ class Run:
             self.wait(60, 'monitor')
         subprocess.run(['bash', script, 'stop', '-s', self.dev.serial], capture_output=True)
 
-    # ------------------------------------------------------------------ battery rundown
+    # ---- Phase battery_rundown: video playback from full charge to the automatic shutdown ----------------------------
     def ensure_media(self, key):
         """(device path, sha256) of media file `key` of third_party/media.lock in /sdcard/Movies/: the device copy when
         its sha256 matches the lock, else pushed from STAB_MEDIA_DIR after checking its size and sha256 there."""
@@ -1516,9 +1838,10 @@ class Run:
         return path, sha
 
     def rundown_identity(self, pkg, ver, clip, apk_file):
-        """Appends the rundown's conditions to identity.txt: kernel command line and console log level (the vendor kernel
-        on T11206 prints ~270 lines a second during playback, which costs power, so the runs compared must have the
-        same), the battery's uevent, the player's version and the clip; Abort when the player is not version `ver`."""
+        """Appends the rundown's conditions to identity.txt: kernel command line and console log level (the vendor
+        kernel on T11206 prints ~270 lines a second during playback, which costs power, so the runs compared must have
+        the same), the battery's uevent, the player's version and the clip; Abort when the player is not version
+        `ver`."""
         _, out = self.dev.sh(f'cat /proc/cmdline; echo "printk $(cat /proc/sys/kernel/printk)"; {BATTERY_DIR}; '
                              'echo "battery $(tr "\\n" " " < $B/uevent)"; '
                              f'dumpsys package {pkg} | grep -m2 -oE "versionName=[^ ]+|versionCode=[0-9]+"', timeout=60)
@@ -1606,8 +1929,9 @@ class Run:
                 self.event('INFO', 'battery full (100 %, Full)')
                 return
             if time.time() >= end:
-                raise Abort(f"battery_rundown: battery not full after {p['charge_timeout_h']} h on USB ({cap} %, {status})")
-            if shown != (cap // 10 if cap is not None else None, status):
+                raise Abort(f"battery_rundown: battery not full after {p['charge_timeout_h']} h on USB "
+                            f"({cap} %, {status})")
+            if shown != (cap // 10 if cap is not None else None, status):  # an INFO per 10 % step or status change
                 shown = (cap // 10 if cap is not None else None, status)
                 self.event('INFO', f'charging: {cap} % {status}; waiting for 100 % and Full')
             self.wait(60, 'charging')
@@ -1615,7 +1939,8 @@ class Run:
     def rundown_start_sampler(self, p, pkg):
         """device/rundown.sh started detached as root (it survives the USB unplug) on a new file; (path, columns)."""
         path = f"{RUNDOWN}/rundown-{time.strftime('%Y%m%d-%H%M%S')}.csv"
-        _, out = self.dev.su(f'mkdir -p {RUNDOWN} && rm -f {RUNDOWN}/rundown.pid; setsid nohup sh {DEV}/rundown.sh {path} '
+        _, out = self.dev.su(f'mkdir -p {RUNDOWN} && rm -f {RUNDOWN}/rundown.pid; '
+                             f'setsid nohup sh {DEV}/rundown.sh {path} '
                              f"{int(p['sample_s'])} {pkg} > /dev/null 2>&1 < /dev/null & sleep 3; head -1 {path}",
                              timeout=60)
         head = next((l.strip() for l in (out or '').splitlines() if l.startswith('epoch,')), '')
@@ -1633,7 +1958,8 @@ class Run:
             self.dev.sh(f'pm grant {pkg} android.permission.{perm}', timeout=30)
         self.dev.sh(f'appops set {pkg} MANAGE_EXTERNAL_STORAGE allow', timeout=30)
         self.screen(True)
-        _, out = self.dev.sh(f'am force-stop {pkg}; sleep 1; am start -W -a android.intent.action.VIEW -d file://{clip} '
+        _, out = self.dev.sh(f'am force-stop {pkg}; sleep 1; '
+                             f'am start -W -a android.intent.action.VIEW -d file://{clip} '
                              f"-t video/mp4 --ez from_start true -n {pkg}/{p['activity']}", timeout=90)
         self.save('rundown-player-start.txt', out or '')
         time.sleep(15)
@@ -1719,6 +2045,7 @@ class Run:
         live = RundownLive(os.path.join(self.out, 'rundown-live.csv'), head, p['sample_s']) if self.serial else None
         view = bool(live)
 
+        # one update of the live view (rundown_follow); an exception ends only the view, never the run
         def follow():
             nonlocal soff, view
             try:
@@ -1774,7 +2101,8 @@ class Run:
         finally:
             self.expect_reboot = False
         new = h.get('boot_id') != boot
-        _, br = self.dev.sh('getprop sys.boot.reason.last; getprop persist.sys.boot.reason.history | head -3', timeout=30)
+        _, br = self.dev.sh('getprop sys.boot.reason.last; getprop persist.sys.boot.reason.history | head -3',
+                            timeout=30)
         self.save('rundown-boot-reason.txt', br or '')
         self.event('INFO', ('new boot after the rundown, as expected' if new else
                             'same boot as before the unplug: USB came back before a shutdown')
@@ -1798,12 +2126,28 @@ class Run:
             self.unexpected_reboot(prev, h)
 
     def phase_battery_rundown(self, p):
-        """Video playback battery life from full charge to the automatic shutdown (README, battery_rundown): identity and
-        settings recorded, battery charged to full, settings applied, sampler and player started and checked; then
-        the operator unplugs USB; the device is away until it is powered on again; then sampler and player are stopped,
-        the sample file pulled, settings restored (before the first snapshot of the new boot), report written. Whenever
-        the run stops before that restore (an abort, a timeout, an exception, Ctrl-C or SIGTERM, in any stage), a device
-        that answers gets the same stop and restore, and one that does not gets a RESTORE_FAIL with the command."""
+        """Video playback battery life from full charge to the automatic shutdown (README, battery_rundown): identity
+        and settings recorded, battery charged to full, settings applied, sampler and player started and checked; then
+        the operator unplugs USB; the device is away until it is powered on again; then sampler and player are
+        stopped, the sample file pulled, settings restored (before the first snapshot of the new boot), report
+        written. Whenever the run stops before that restore (an abort, a timeout, an exception, Ctrl-C or SIGTERM, in
+        any stage), a device that answers gets the same stop and restore, and one that does not gets a RESTORE_FAIL
+        with the command.
+
+        Exercises the whole device's power use under the hypervisor over a long playback (interrupt injection, idle
+        entry and exit, frequency changes on every cluster). Parameters (defaults in rundown_report.DEFAULTS): `apk`
+        (vlc: key in third_party/apks.lock), `media` (bbb60: key in third_party/media.lock), `brightness` (128, raw
+        backlight), `refresh_hz` (90), `volume` (3 of 15), `airplane` (true), `sample_s` (60), `charge_timeout_h` (4),
+        `unplug_timeout_min` (30), `return_timeout_h` (24), `activity` (VLC's video player activity).
+        Files: identity.txt (appended), rundown-settings.json (original settings and the restore commands),
+        rundown-settings-apply.txt, rundown-player-start.txt, rundown-start-state.json, rundown-live.csv (with a
+        serial capture), rundown-device.csv, rundown-boot-reason.txt, rundown-summary.md and rundown.json.
+        Records: Abort when the player or clip is missing or wrong, the battery is not full in time, a start check
+        fails (rundown_checks), USB is not unplugged or the device not back in time; INFO for the progress (charging,
+        ready, unplug, live samples, back, result); RUNDOWN_INVALID (warning) per validity flag of the report and
+        when the device's sample file is not read back;
+        RESTORE_FAIL (warning); UNEXPECTED_REBOOT (error) when a new boot came although the samples show the battery
+        did not run down. Restores: the settings, the sampler and the player stopped (see above)."""
         p = {**rundown_report.DEFAULTS, **p}
         apk = lock_entries('apks.lock', 6).get(p['apk'])
         if not apk:
@@ -1832,7 +2176,8 @@ class Run:
                 raise Abort('battery_rundown not started: ' + '; '.join(bad))
             self.event('INFO', f"rundown ready: {pkg} playing {clip[0]} (hardware decoder {st['hw'][1] or '?'}), "
                        f"backlight {st['backlight']}, refresh {'/'.join(st['vsync'])} Hz, volume {st['volume']}")
-            msg = f"UNPLUG USB NOW: the rundown starts when USB is unplugged (waiting up to {p['unplug_timeout_min']} min)"
+            msg = ("UNPLUG USB NOW: the rundown starts when USB is unplugged "
+                   f"(waiting up to {p['unplug_timeout_min']} min)")
             print('\n' + '=' * 100 + f'\n    {msg}\n' + '=' * 100 + '\n', flush=True)
             self.event('INFO', msg)
             boot = self.rundown_wait_unplug(p)
@@ -1847,7 +2192,7 @@ class Run:
             if stage in ('before', 'away', 'back'):
                 self.rundown_abandon(stage, orig, pkg, path)
 
-    # ------------------------------------------------------------------ TEE idle
+    # ---- Phase tee_idle: Trusty IRQ-off reports with deep idle on and off --------------------------------------------
     def cpuidle_states(self):
         """{disable file of every CPU's idle state 1 and above (the deep ones; state 0 is WFI): its value}."""
         _, out = self.dev.su(f'for f in {CPUIDLE}; do [ -e "$f" ] && echo "$f=$(cat $f)"; done', timeout=60)
@@ -1865,6 +2210,7 @@ class Run:
         return [f for f, v in values.items() if now.get(f) != str(v)]
 
     def kmsg(self, text):
+        """Writes `text` as a line into the device's kernel log (/dev/kmsg, as root)."""
         self.dev.su(f'echo {shlex.quote(text)} > /dev/kmsg', timeout=30)
 
     def tee_idle_block(self, b, out, klog, soff, thr):
@@ -1892,23 +2238,38 @@ class Run:
                    f"interrupts {r['trusty_irq']}; Trusty IRQ-off reports >= {thr:g} ms: device log {fmt(r['device'])}"
                    + (f"; serial {fmt(r['serial'])}" if self.serial else ''))
         if r['device'] is None and r['serial'] is None:
-            self.event('SKIP', f"{b['name']}: the block's markers are in no copy of the kernel log (device/klogwatch.sh "
-                       'not running, no serial capture): nothing counted')
+            self.event('SKIP', f"{b['name']}: the block's markers are in no copy of the kernel log "
+                       '(device/klogwatch.sh not running, no serial capture): nothing counted')
         s = tee_best(r)
         if s and s['ge_thr']:
-            self.event('TEE_IRQSOFF', f"{b['name']}: {s['ge_thr']} Trusty IRQ-off reports >= {thr:g} ms with deep idle {idle} "
-                       f"(longest {s['longest']} ms, call sites {s['sites']})")
+            self.event('TEE_IRQSOFF', f"{b['name']}: {s['ge_thr']} Trusty IRQ-off reports >= {thr:g} ms "
+                       f"with deep idle {idle} (longest {s['longest']} ms, call sites {s['sites']})")
         return r
 
     def phase_tee_idle(self, p):
-        """The TEE load of el2stress.sh's tee step without cyclictest, in blocks with the CPUs' deep idle states on or off
-        (default: on, off, on again, 600 s each): a Trusty call that kept the Host's IRQs off for hundreds of ms showed
-        up only while CPUs used deep idle (T11206, 2026-10-14: 6 / 0 / 1 reports >= 30 ms before the fix, 0 / 0 / 0
-        after). Each block is bracketed by 'STAB TEE_IDLE <block> start|end' kernel-log markers; a detached `dmesg -w`
-        follower on the device (klogwatch.sh) keeps the IRQ-off reports and markers, so no serial capture is needed;
-        with one, its count is reported too, as a cross-check. The original deep idle settings are restored at the end
-        and on any abort or Ctrl-C (RESTORE_FAIL when they do not read back); the load and the follower are stopped only
-        while their pids still run them (stop_cmd). Results in tee-idle.json and a table in summary.md."""
+        """The TEE load of el2stress.sh's tee step without cyclictest, in blocks with the CPUs' deep idle states on or
+        off (default: on, off, on again, 600 s each): a Trusty call that kept the Host's IRQs off for hundreds of ms
+        showed up only while CPUs used deep idle (T11206, 2026-10-14: 6 / 0 / 1 reports >= 30 ms before the fix,
+        0 / 0 / 0 after). Each block is bracketed by 'STAB TEE_IDLE <block> start|end' kernel-log markers; a detached
+        `dmesg -w` follower on the device (klogwatch.sh) keeps the IRQ-off reports and markers, so no serial capture is
+        needed; with one, its count is reported too, as a cross-check. The original deep idle settings are restored at
+        the end and on any abort or Ctrl-C (RESTORE_FAIL when they do not read back); the load and the follower are
+        stopped only while their pids still run them (stop_cmd). Results in tee-idle.json and a table in summary.md.
+
+        Exercises the forwarding of TEE calls (SMCs) and the Trusty notification interrupt under the hypervisor, with
+        CPUs entering and leaving deep idle. Parameters: `blocks` (default TEE_IDLE_BLOCKS; each with `name`,
+        `deep_idle` (default true) and `seconds` (default 600)), `workers` (TEE workers, default 2), `threshold_ms`
+        (default 30). Per block: phase <phase>/<block>, PHASE_START and a phase marker; every deep idle state (1 and
+        above) of every CPU enabled or disabled; the block's start marker; `TEE_CYCLIC=0 TEE_WORKERS=<workers>
+        el2stress.sh tee <seconds>` started detached; the block's seconds waited (checkpoints go on), then up to 300 s
+        more for 'EL2STRESS_DONE tee'; the end marker, 3 s; output saved as tee-idle-<block>.txt; the reports counted
+        (tee_idle_block); PHASE_END.
+        Records: per block INFO with TEE ops, failures, Trusty interrupts and the report counts of each copy;
+        TEE_IRQSOFF (warning) when a copy has reports at or above threshold_ms; INFO when some idle states kept another
+        value; STRESS_FAIL (error) when EL2STRESS_DONE did not come (the load is then stopped) or a part's rc is not 0;
+        SKIP when the device has no deep idle states or a block's markers are in no copy of the kernel log;
+        RESTORE_FAIL (warning) or INFO for the restore. Files: tee-idle-cpuidle.txt (the original values),
+        tee-idle-<block>.txt, tee-idle.json."""
         blocks = p.get('blocks', TEE_IDLE_BLOCKS)
         w, thr, base = int(p.get('workers', 2)), float(p.get('threshold_ms', 30)), self.phase
         orig = self.cpuidle_states()
@@ -1916,7 +2277,8 @@ class Run:
             self.event('SKIP', 'tee_idle: no cpuidle states 1 and above on this device')
             return
         self.save('tee-idle-cpuidle.txt', ''.join(f'{f}={v}\n' for f, v in orig.items()))
-        klog = f'{DEV}/tmp/tee-idle-klog.txt'
+        klog = f'{DEV}/tmp/tee-idle-klog.txt'  # the follower's copy of the IRQ-off reports and markers (pid in .pid)
+        # stops the follower (only while its pid still runs klogwatch or its awk) and removes its pid file
         watch = stop_cmd(f'$(cat {klog}.pid 2>/dev/null)', 'klogwatch|awk') + f'; rm -f {klog}.pid'
         results, pid = [], None
         try:
@@ -1924,6 +2286,7 @@ class Run:
             self.dev.su(f'{watch}; rm -f {klog}; setsid nohup sh {DEV}/klogwatch.sh {klog} '
                         '"irqsoff_warn|STAB TEE_IDLE" > /dev/null 2>&1 < /dev/null &', timeout=30)
             for b in blocks:
+                # the plan's block with its defaults: name, deep (deep idle on), seconds
                 b = {'name': b['name'], 'deep': bool(b.get('deep_idle', True)), 'seconds': int(b.get('seconds', 600))}
                 self.phase = f"{base}/{b['name']}"
                 self.event('PHASE_START', f"{b['name']}: deep idle {'on' if b['deep'] else 'off'}, {b['seconds']} s, "
@@ -1974,11 +2337,18 @@ class Run:
             else:
                 self.event('INFO', f'tee_idle: deep idle settings restored ({len(orig)} states)')
             self.phase = base
-            self.save('tee-idle.json', json.dumps({'threshold_ms': thr, 'workers': w, 'blocks': results}, indent=1) + '\n')
+            self.save('tee-idle.json', json.dumps({'threshold_ms': thr, 'workers': w, 'blocks': results}, indent=1)
+                      + '\n')
         self.mark_phase()  # back in the outer phase: later kernel lines are not the last block's
 
-    # ------------------------------------------------------------------ driver
+    # ---- Driver: execute ---------------------------------------------------------------------------------------------
     def execute(self, expect_sha):
+        """The whole run: plan.json saved, setup, then each phase of the plan as '<n>-<type>' (PHASE_START with the
+        plan entry, a phase marker, phase_<type>(entry), not-responding dialogs dismissed, a snapshot, PHASE_END with
+        the minutes into the run). An Abort, Ctrl-C / SIGTERM or a harness error (traceback in harness-error.txt) ends
+        the phases with an ABORT event, so the run is FAIL. Always, at the end: monkey stopped, a last serial scan,
+        with the EL2 log a last pull, the EL2 report (el2-summary.md) and the monitor and its sampling loop stopped,
+        and summary.md written."""
         self.save('plan.json', json.dumps(self.plan, indent=2, ensure_ascii=False))
         t0 = time.time()
         try:
@@ -2016,6 +2386,7 @@ class Run:
             write_summary(self.out)
 
 
+# ==== Report: summary.md ==============================================================================================
 def count(evs):
     """Findings in these events: an aggregated event carries `count`."""
     return sum(e.get('count', 1) for e in evs)
@@ -2037,6 +2408,10 @@ def rundown_lines(out):
 
 
 def write_summary(out):
+    """Writes summary.md of run directory `out` from its events.jsonl and prints its path and verdict: FAIL when any
+    event is an error (ERRORS) or an ABORT, else PASS. Contents: the boot_a identity line, pointers to the EL2 and
+    battery rundown reports when they exist, event / error / warning counts and a count per kind, the TEE idle table,
+    the phase starts and ends, every error, and the first 20 warnings of each kind."""
     evs = [json.loads(l) for l in open(os.path.join(out, 'events.jsonl')) if l.strip()]
     errors = [e for e in evs if e['kind'] in ERRORS]
     warns = [e for e in evs if e['kind'] in WARNINGS]
@@ -2045,7 +2420,8 @@ def write_summary(out):
         os.path.join(out, 'identity.txt')) else '?'
     verdict = 'FAIL' if errors or any(e['kind'] == 'ABORT' for e in evs) else 'PASS'
     L = [f'# Stability run {os.path.basename(out)}: {verdict}', '', f'- identity: `{ident}`',
-         *(['- EL2 parallel log: el2-summary.md, el2-per-second.csv'] if os.path.exists(os.path.join(out, 'el2-summary.md')) else []),
+         *(['- EL2 parallel log: el2-summary.md, el2-per-second.csv']
+           if os.path.exists(os.path.join(out, 'el2-summary.md')) else []),
          *rundown_lines(out),
          f'- events: {count(evs)}; errors {count(errors)}; warnings {count(warns)} (an event with a count stands for '
          'that many findings of one kind)', '', '| kind | count |', '|---|---|']
@@ -2066,7 +2442,10 @@ def write_summary(out):
     print(f'summary: {os.path.join(out, "summary.md")} -> {verdict}')
 
 
+# ==== Command line ====================================================================================================
 def main():
+    """`stab.py run ...` runs a plan on a device; `stab.py report DIR` rewrites DIR/summary.md (see the module
+    docstring, which is the --help text)."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('run')
@@ -2093,6 +2472,8 @@ def main():
     dev = Device(a.serial)
     run = Run(dev, a.out, plan)
     run.serial = a.serial_log or None
+
+    # SIGTERM ends the run like Ctrl-C: the phases' cleanup runs and the summary is written
     def on_term(*_):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, on_term)
