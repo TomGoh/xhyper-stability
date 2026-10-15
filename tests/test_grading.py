@@ -6,7 +6,7 @@
 import contextlib, io, json, os, shutil, subprocess, sys, tempfile, unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'host'))
 import compare  # noqa: E402
 import stab  # noqa: E402
 

@@ -7,7 +7,7 @@ device's and the serial capture's formats, and a scripted fake device.
 import contextlib, io, json, os, re, shlex, shutil, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'host'))
 import stab  # noqa: E402
 
 BOOT = '0b0e1d2c-1111-4222-8333-944455556666'

@@ -17,6 +17,7 @@
 | `third_party/apks.lock` | 测试会安装的 APK 清单（文件名、包名、版本、sha256）；APK 本身不进仓库（许可、体积、内部应用），运行时从 `STAB_APK_DIR` 目录取，哈希对上才装 |
 | `third_party/media.lock` | 测试要播放的媒体文件清单（文件名、大小、sha256、许可和来源）；文件本身不进仓库，运行时从 `STAB_MEDIA_DIR` 目录取，大小和哈希对上、且设备上 `/sdcard/Movies/` 里的副本哈希不同时才推送 |
 | `third_party/` | 公开压力工具的固定版本和静态 aarch64 构建脚本（stress-ng、stressapptest、rt-tests 的 cyclictest），以及 Fastbot 的拉取脚本；编出的程序不入库 |
+| `tests/` | 本仓库代码自身的单元测试：主机端的解析、定级和报告，以及设备端脚本在伪造输入上的行为；不连测试机，在仓库根目录运行 `python3 -m unittest discover -s tests` |
 
 ## 用法
 

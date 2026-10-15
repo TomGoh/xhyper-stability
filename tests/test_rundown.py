@@ -7,7 +7,7 @@ and a scripted fake device.
 import contextlib, io, json, os, shlex, shutil, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'host'))
 import rundown_report as rr  # noqa: E402
 import stab  # noqa: E402
 
