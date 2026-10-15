@@ -1695,7 +1695,7 @@ class Run:
         device/el2stress.sh's header: ipi, timer, idle, traffic, affinity, hotplug, pmu, radio, copy, gpu, tee, all).
         Parameters: `steps` (default ipi, timer, idle, traffic, affinity, hotplug, pmu, all; a repeated step runs as
         <step>-r2, ... with its own phase, events, files and EL2 summary row), `seconds` per step (default 180).
-        glmark2 is installed first (ensure_apks) when the plan's `steps` name gpu or all (not for the default list).
+        glmark2 is installed first (ensure_apks) when the steps (the plan's or the default list) include gpu or all.
         Per step (<name>: the step, or <step>-r<n>): phase <phase>/<name>, PHASE_START and a kernel-log marker; for
         pmu with the EL2 log the monitor is stopped first (it owns the PMU while it counts) and brought up again
         after; traffic, affinity and all also get USB bulk traffic from the host (not through a remote adb server);
@@ -1713,9 +1713,10 @@ class Run:
         m = re.search(r'default via (\S+) dev wlan0', rt)
         gw = m.group(1) if m else ''
         base, secs = self.phase, int(p.get('seconds', 180))
-        if any(s_ in ('gpu', 'all') for s_ in p.get('steps', [])):
-            self.ensure_apks(['glmark2'])
         steps = p.get('steps', ['ipi', 'timer', 'idle', 'traffic', 'affinity', 'hotplug', 'pmu', 'all'])
+        # gpu and all run glmark2 (the default list ends with all)
+        if any(s_ in ('gpu', 'all') for s_ in steps):
+            self.ensure_apks(['glmark2'])
         # a repeated step runs as <step>-r2, ...: its own phase, events, files and EL2 summary row
         for step, name in zip(steps, step_names(steps)):
             self.phase = f'{base}/{name}'

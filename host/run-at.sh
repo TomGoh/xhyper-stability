@@ -20,7 +20,8 @@ command -v caffeinate >/dev/null && caffeinate -i -s -w $$ &
 # ---- wait for the start time -----------------------------------------------------------------------------------------
 now=$(date +%s)
 # The next HH:MM as epoch seconds: today's (BSD date, else GNU date), or tomorrow's when today's has passed.
-target=$(date -j -f '%Y-%m-%d %H:%M' "$(date +%Y-%m-%d) $AT" +%s 2>/dev/null || date -d "today $AT" +%s)
+# BSD date takes the fields the format leaves out from the current time, so the seconds are given as :00.
+target=$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date +%Y-%m-%d) $AT:00" +%s 2>/dev/null || date -d "today $AT" +%s)
 [ "$target" -le "$now" ] && target=$((target + 86400))
 echo "$(date '+%F %T') waiting until" \
   "$(date -r "$target" '+%F %T' 2>/dev/null || date -d "@$target" '+%F %T')" > "$OUT.console"

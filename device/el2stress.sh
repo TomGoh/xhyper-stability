@@ -150,8 +150,16 @@ affinity() {
          sort -rn |
          awk '$1 > 0 { sub(":", "", $2); print $2 }' |
          head -8)
-  # Plus the tick-broadcast timer (GIC hwirq 79).
-  irqs="$irqs $(awk '$10 == "GICv3" && $11 == 79 { sub(":", "", $1); print $1 }' /proc/interrupts)"
+  # Plus the tick-broadcast timer (GIC hwirq 79), unless it is already among the busiest: listed twice, its route
+  # would be saved again after the first write had moved it to CPU 0, and the restore would leave it on CPU 0.
+  irqs=$(echo $irqs)   # one line, single spaces
+  tick=$(awk '$10 == "GICv3" && $11 == 79 { sub(":", "", $1); print $1 }' /proc/interrupts)
+  if [ -n "$tick" ]; then
+    case " $irqs " in
+      *" $tick "*) ;;
+      *) irqs="$irqs $tick" ;;
+    esac
+  fi
   orig=""     # "<irq>=<original CPU list>" of every IRQ whose route is writable
   routed=""   # the IRQs that took the first write (route to CPU 0): the ones moved below
   for irq in $irqs; do
@@ -379,7 +387,8 @@ gpu() {
 # Parameters: <seconds>; TEE_WORKERS (default 2), TEE_CYCLIC (0: no cyclictest).
 # Prints: "EL2STRESS <step> tee workers=<n> ops=<keystore calls> failures=<n> trusty_irq=<trusty interrupts during
 #   the step> cyclictest_max_us=[<max latency per thread, comma separated>] rc=<0|1>", with "cyclictest=off" in place
-#   of cyclictest_max_us=[...] when TEE_CYCLIC=0; "EL2STRESS <step> keystore_cli_v2 missing rc=3" without the tool.
+#   of cyclictest_max_us=[...] when TEE_CYCLIC=0 and "cyclictest=missing" without the binary; "EL2STRESS <step>
+#   keystore_cli_v2 missing rc=3" without the tool.
 # Fails: a key generation that fails or a sign-verify that does not print "Verify: OK" (failures=, rc=1);
 #   keystore_cli_v2 missing (rc=3).
 # Restores: every key named stab_tee_* is deleted at the end.
@@ -387,7 +396,9 @@ tee() {
   command -v keystore_cli_v2 > /dev/null || { echo "EL2STRESS $STEP keystore_cli_v2 missing rc=3"; return; }
   # trusty: the count of the interrupt named trusty, summed over the 8 CPUs.
   trusty() { awk '$NF == "trusty" { s = 0; for (i = 2; i <= 9; i++) s += $i; print s }' /proc/interrupts; }
-  # cyclictest alongside (see above), in the background for DURATION seconds.
+  # cyclictest alongside (see above), in the background for DURATION seconds. The log of an earlier run is removed
+  # first, so that its latencies are never reported as this run's.
+  rm -f $TMP_DIR/tee-cyclic.log
   [ "${TEE_CYCLIC:-1}" != 0 ] && [ -x $STAB_DIR/cyclictest ] \
     && $STAB_DIR/cyclictest -m -p 90 -i 1000 -t -a -q -D ${DURATION}s > $TMP_DIR/tee-cyclic.log 2>&1 &
   trusty_start=$(trusty)
@@ -435,6 +446,7 @@ tee() {
   # cyclictest's "Max:" latency of every thread, comma separated.
   cmax=$(grep -oE 'Max: *[0-9]+' $TMP_DIR/tee-cyclic.log 2>/dev/null | awk '{printf "%s%s", sep, $2; sep=","}')
   cyc="cyclictest_max_us=[$cmax]"
+  [ -x $STAB_DIR/cyclictest ] || cyc=cyclictest=missing
   [ "${TEE_CYCLIC:-1}" = 0 ] && cyc=cyclictest=off
   echo "EL2STRESS $STEP tee workers=$workers ops=$ops failures=$failures trusty_irq=$((trusty_end - trusty_start))" \
     "$cyc rc=$([ $failures = 0 ] && echo 0 || echo 1)"
